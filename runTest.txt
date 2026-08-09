@@ -1,0 +1,7 @@
+Before run, make sure in the correct path, then activate venv. After that run the python scripts  
+
+tensorflow-101
+    (.venv) PS C:\Florence's\Work Environtment\Magang - Imigrasi\Facial Scores\Simmilar Projects - References\tensorflow-101\python> python facial-expression-recognition-from-stream.py
+
+Bhavna
+    (.venv) PS C:\Florence's\Work Environtment\Magang - Imigrasi\Facial Scores\Simmilar Projects - References\Bhavna-Your-Emotion-Detector> python face_detection.py

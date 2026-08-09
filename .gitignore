@@ -1,0 +1,12 @@
+.venv/
+Simmilar Projects - References/
+
+#Trial_1
+Trial_1/.ipynb_checkpoints/
+Trial_1/.venv/
+Trial_1/images/
+
+#Trial_2
+Trial_2 - prototype/.ipynb_checkpoints/
+Trial_2 - prototype/.venv-feat/
+Trial_2 - prototype/.venv-openface/
