@@ -5,3 +5,12 @@ tensorflow-101
 
 Bhavna
     (.venv) PS C:\Florence's\Work Environtment\Magang - Imigrasi\Facial Scores\Simmilar Projects - References\Bhavna-Your-Emotion-Detector> python face_detection.py
+
+Prototype 0.1
+    run openface
+        cd "C:\OpenFace\OpenFace_2.2.0_win_x64"
+        .\FeatureExtraction.exe -device 0 -out_dir "C:\OpenFace\live_output" -of "session1"
+    run py
+        PS C:\Florence's\Work Environtment\Magang - Imigrasi> cd '.\Facial Scores\Trial_2 - Prototype'
+        .venv-openface\Scripts\activate.ps1  
+        python prototype_01_OpenFace.py
