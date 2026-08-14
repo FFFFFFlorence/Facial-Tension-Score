@@ -1,5 +1,6 @@
 .venv/
 Simmilar Projects - References/
+Real-life Deception Detection Dataset With Train Test/
 
 #Trial_1
 Trial_1/.ipynb_checkpoints/
@@ -10,3 +11,4 @@ Trial_1/images/
 Trial_2 - prototype/.ipynb_checkpoints/
 Trial_2 - prototype/.venv-feat/
 Trial_2 - prototype/.venv-openface/
+Trial_2 - prototype/dump/
