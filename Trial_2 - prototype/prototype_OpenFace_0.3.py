@@ -122,7 +122,7 @@ plt.subplots_adjust(bottom=0.32, right=0.70, top=0.83)  # top=0.83 matches the g
 line, = ax.plot([], [], color='black', linewidth=1.6, zorder=5)
 ax.set_xlabel("Time (s)")
 ax.set_ylabel("Tension Score (relative to baseline)")
-ax.set_title("Live Tension Monitor - PROTOTYPE (data-informed weights v8) (click Start to begin)")
+ax.set_title("Live Tension Monitor - PROTOTYPE")
 ax.axhline(0, color='gray', linestyle='--', linewidth=1)
 
 
@@ -197,7 +197,7 @@ def start_openface(event):
     log_rows = []
 
     session_started = True
-    ax.set_title("Live Tension Monitor - PROTOTYPE (data-informed weights v8) (calibrating baseline...)")
+    ax.set_title("Live Tension Monitor - PROTOTYPE (calibrating baseline...)")
     start_button.label.set_text("Running...")
     fig.canvas.draw_idle()
     print("OpenFace launched. Calibrating baseline - please stay neutral...")
@@ -523,7 +523,7 @@ def update_plot(frame_num):
             if elapsed >= BASELINE_DURATION_SECONDS:
                 baseline_mean = np.mean(baseline_scores)
                 baseline_established = True
-                ax.set_title("Live Tension Monitor - PROTOTYPE (data-informed weights v8)")
+                ax.set_title("Live Tension Monitor - PROTOTYPE")
                 print(f"Baseline established: {baseline_mean:.3f} (from {len(baseline_scores)} frames)")
             continue
 

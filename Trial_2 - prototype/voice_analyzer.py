@@ -28,6 +28,27 @@ SAMPLE_RATE = 16000
 CHUNK_SECONDS = 2.0          # analyze audio in 2-second rolling chunks
 SILENCE_THRESHOLD_DB = -40   # below this = considered silence/pause
 
+# Above this pause_ratio, a chunk is treated as "not currently speaking"
+# rather than "hesitating while speaking". Sustained silence after calming
+# down is a healthy, expected behavior - it should NOT keep pushing the
+# tension score up. Only partial/intermittent pausing (someone still
+# talking, but breaking up their speech) counts as a hesitation signal.
+NEAR_TOTAL_SILENCE_THRESHOLD = 0.85
+
+
+def pause_hesitation_score(pause_ratio):
+    """
+    Converts a raw pause_ratio (fraction of a chunk that was silent) into a
+    hesitation signal. Raw pause_ratio increases both when someone hesitates
+    mid-sentence AND when someone has simply stopped talking altogether -
+    but only the former is actually tension-related. Near-total silence
+    (barely any speech in the chunk at all) is zeroed out here so that
+    "I calmed down and stopped talking" doesn't itself read as more tense.
+    """
+    if pause_ratio >= NEAR_TOTAL_SILENCE_THRESHOLD:
+        return 0.0
+    return pause_ratio
+
 
 class VoiceAnalyzer:
     """
@@ -36,7 +57,7 @@ class VoiceAnalyzer:
     acoustic markers), analogous to the facial au_score.
     """
 
-    def __init__(self, history_len=10):
+    def __init__(self, history_len=5):
         self.running = False
         self.thread = None
 
@@ -139,14 +160,15 @@ class VoiceAnalyzer:
         """
         pitch_var = float(np.std(self.pitch_history)) if len(self.pitch_history) > 1 else 0.0
         jitter_mean = float(np.mean(self.jitter_history)) if self.jitter_history else 0.0
-        pause_mean = float(np.mean(self.pause_ratio_history)) if self.pause_ratio_history else 0.0
+        pause_mean_raw = float(np.mean(self.pause_ratio_history)) if self.pause_ratio_history else 0.0
+        pause_mean = pause_hesitation_score(pause_mean_raw)
         intensity_var = float(np.mean(self.intensity_std_history)) if self.intensity_std_history else 0.0
 
         # normalize rough scales so no single feature dominates purely due to units
         score = (
             (pitch_var / 20.0) * 0.30 +      # pitch variability in Hz, scaled down
             (jitter_mean * 100) * 0.30 +     # jitter is a small fraction, scale up
-            (pause_mean) * 0.20 +            # already 0-1
+            (pause_mean) * 0.20 +            # hesitation-adjusted, not raw silence
             (intensity_var / 10.0) * 0.20    # intensity std in dB, scaled down
         )
 
@@ -155,7 +177,7 @@ class VoiceAnalyzer:
             "pitch_mean": self.pitch_history[-1] if self.pitch_history else 0.0,
             "pitch_variability": pitch_var,
             "jitter": jitter_mean,
-            "pause_ratio": pause_mean,
+            "pause_ratio": pause_mean_raw,  # report the raw value for transparency in the UI
             "intensity_variability": intensity_var,
         }
 
@@ -206,7 +228,8 @@ class VoiceAnalyzer:
         """Same weighting formula as the live _update_score, exposed for reuse offline."""
         pitch_var = float(np.std(pitch_hist)) if len(pitch_hist) > 1 else 0.0
         jitter_mean = float(np.mean(jitter_hist)) if jitter_hist else 0.0
-        pause_mean = float(np.mean(pause_hist)) if pause_hist else 0.0
+        pause_mean_raw = float(np.mean(pause_hist)) if pause_hist else 0.0
+        pause_mean = pause_hesitation_score(pause_mean_raw)
         intensity_var = float(np.mean(intensity_hist)) if intensity_hist else 0.0
         return (
             (pitch_var / 20.0) * 0.30 +
