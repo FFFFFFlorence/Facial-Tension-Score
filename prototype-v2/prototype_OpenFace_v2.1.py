@@ -531,7 +531,7 @@ legend_ax.text(0.01, 0.74, "BASELINE", fontsize=8, color="#2e7d32", va="top", ha
 legend_ax.text(0.105, 0.74, " = Sesuai kondisi awal - menandai ekspresi normal/netral.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
 
 legend_ax.text(0.01, 0.56, "ELEVATED", fontsize=8, color="#c77700", va="top", ha="left", transform=legend_ax.transAxes)
-legend_ax.text(0.105, 0.56, " = Peningkatan pola tension - bisa karena gugup, berpikir keras, tidak nyaman, dll", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
+legend_ax.text(0.105, 0.56, " = Peningkatan pola tension - bisa karena gugup, berpikir keras, tidak nyaman, dll.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
 
 legend_ax.text(0.01, 0.38, "HIGH", fontsize=8, color="#b00020", va="top", ha="left", transform=legend_ax.transAxes)
 legend_ax.text(0.105, 0.38, " = Peningkatan pola tension yang signifikan - terindikasi tekanan tinggi.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
