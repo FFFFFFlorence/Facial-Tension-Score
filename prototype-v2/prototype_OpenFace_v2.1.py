@@ -244,7 +244,7 @@ def compute_gaze_variance_score():
 # Plot setup - same base line chart as the original, with threshold zones added
 # ---------------------------------------------------------------------------
 fig, ax = plt.subplots(figsize=(10, 5))
-plt.subplots_adjust(bottom=0.32, right=0.70, top=0.83)  # top=0.83 matches the gauge's top edge, so everything lines up
+plt.subplots_adjust(bottom=0.39, right=0.70, top=0.90)  # move the main panel upward while preserving its height
 
 line, = ax.plot([], [], color='black', linewidth=1.6, zorder=5, label="Combined")
 visual_line, = ax.plot([], [], color='#1565c0', linewidth=1.0, alpha=0.6, zorder=4, label="Face only")
@@ -342,6 +342,12 @@ def start_openface(event):
     current_peak_last_rise_time = None
     level_tracker = LevelEpisodeTracker()
     log_rows = []
+    conclusion_level_text.set_visible(True)
+    session_elevated_text.set_visible(False)
+    session_elevated_count_text.set_visible(False)
+    session_separator_text.set_visible(False)
+    session_high_text.set_visible(False)
+    session_high_count_text.set_visible(False)
 
     session_started = True
     ax.set_title("Live Tension Monitor - PROTOTYPE (calibrating baseline...)")
@@ -405,10 +411,16 @@ def stop_openface(event):
         # repurpose the Summary panel to show the final session totals,
         # replacing the periodic timeframe summary now that the session is over
         conclusion_prefix_text.set_text("RINGKASAN SESI:")
-        conclusion_level_text.set_text(
-            f"Elevated {stats['ELEVATED']['count']}x | High {stats['HIGH']['count']}x"
-        )
-        conclusion_level_text.set_color("black")
+        conclusion_level_text.set_visible(False)
+        session_elevated_text.set_text("Elevated")
+        session_elevated_count_text.set_text(f" {stats['ELEVATED']['count']}x")
+        session_high_text.set_text("High")
+        session_high_count_text.set_text(f" {stats['HIGH']['count']}x")
+        session_elevated_text.set_visible(True)
+        session_elevated_count_text.set_visible(True)
+        session_separator_text.set_visible(True)
+        session_high_text.set_visible(True)
+        session_high_count_text.set_visible(True)
         conclusion_detail_text.set_text(
             f"Elevated: {stats['ELEVATED']['total_duration']:.0f}s total, "
             f"terlama {stats['ELEVATED']['longest']:.0f}s\n"
@@ -416,7 +428,7 @@ def stop_openface(event):
             f"terlama {stats['HIGH']['longest']:.0f}s"
         )
         conclusion_note_text.set_text(
-            "Bukan kesimpulan kejujuran - pertimbangkan bersama konteks wawancara."
+            "Bukan kesimpulan kejujuran\npertimbangkan dengan konteks wawancara."
         )
     else:
         ax.set_title("Stopped. No data logged this session.")
@@ -426,11 +438,11 @@ def stop_openface(event):
     print("Session stopped.")
 
 
-button_ax = plt.axes([0.32, 0.18, 0.17, 0.075])
+button_ax = plt.axes([0.32, 0.25, 0.17, 0.075])
 start_button = Button(button_ax, "Start OpenFace")
 start_button.on_clicked(start_openface)
 
-stop_button_ax = plt.axes([0.51, 0.18, 0.17, 0.075])
+stop_button_ax = plt.axes([0.51, 0.25, 0.17, 0.075])
 stop_button = Button(stop_button_ax, "Stop")
 stop_button.on_clicked(stop_openface)
 
@@ -447,9 +459,37 @@ def toggle_voice(label):
     print(f"Voice detection {'enabled' if voice_enabled else 'disabled'} - takes effect on next Start.")
 
 
-voice_toggle_ax = plt.axes([0.32, 0.09, 0.36, 0.06])
+# voice_toggle_ax = plt.axes([0.32, 0.09, 0.36, 0.06])
+# voice_toggle_ax = plt.axes([0.38, 0.12, 0.36, 0.06])
+# voice_toggle_ax = plt.axes([0.686, 0.32, 0.36, 0.06])
+# voice_toggle_ax.set_zorder(10)
+# voice_toggle_ax.set_frame_on(False)
+# voice_toggle = CheckButtons(voice_toggle_ax, ["Enable Voice Detection"], [True])
+# voice_toggle.labels[0].set_x(0.19)
+# voice_toggle.on_clicked(toggle_voice)
+import matplotlib.pyplot as plt
+from matplotlib.widgets import CheckButtons
+
+# Create axes for the checkbox
+voice_toggle_ax = plt.axes([0.686, 0.39, 0.36, 0.06])
+voice_toggle_ax.set_zorder(10)
 voice_toggle_ax.set_frame_on(False)
-voice_toggle = CheckButtons(voice_toggle_ax, ["Enable Voice Detection"], [True])
+
+# Instantiate CheckButtons with enlarged frame and checkmark sizes
+# Increase 'sizes' (area in pts^2) to make the square box larger (default is ~100)
+voice_toggle = CheckButtons(
+    voice_toggle_ax, 
+    ["Enable Voice Detection"], 
+    [True],
+    frame_props={'sizes': [75], 'linewidth': 1},
+    check_props={'sizes': [30], 'linewidth': 1}
+)
+
+# Adjust label text position and font size so it doesn't overlap the box
+voice_toggle.labels[0].set_x(0.18)
+voice_toggle.labels[0].set_fontsize(8)
+
+# Attach callback function
 voice_toggle.on_clicked(toggle_voice)
 
 
@@ -459,23 +499,77 @@ voice_toggle.on_clicked(toggle_voice)
 # mechanics. Requested so the tool is interpretable by its actual users,
 # not just by whoever built it.
 # ---------------------------------------------------------------------------
-legend_ax = plt.axes([0.09, 0.01, 0.55, 0.07])
+# legend_ax = plt.axes([0.125, 0.036, 0.5741, 0.09])
+# legend_ax.set_xticks([])
+# legend_ax.set_yticks([])
+# legend_ax.set_frame_on(True)
+
+# legend_text = (
+#     "Panduan Level Tension (dibanding baseline/kondisi awal target sendiri):\n"
+#     "BASELINE (hijau) = sesuai kondisi awal, tidak ada indikasi perubahan\n"
+#     "ELEVATED (kuning) = ada peningkatan pola tension - bisa krn gugup, berpikir keras, tidak nyaman, dll\n"
+#     "HIGH (merah) = peningkatan pola tension yang signifikan\n"
+#     "PENTING: BUKAN alat deteksi kebohongan. Gunakan sebagai bahan pertimbangan tambahan, bukan bukti tunggal."
+# )
+# legend_display = legend_ax.text(
+#     0.01, 0.95, legend_text, fontsize=8, va="top", ha="left",
+#     transform=legend_ax.transAxes, linespacing=1.4,
+# )
+# Perbesar tinggi axes dan turunkan posisi Y sedikit agar tidak mengubah ukuran elemen lain
+legend_ax = plt.axes([0.125, 0.065, 0.5743, 0.115])
 legend_ax.set_xticks([])
 legend_ax.set_yticks([])
 legend_ax.set_frame_on(True)
 
-legend_text = (
-    "Panduan Level Tension (dibanding baseline/kondisi awal target sendiri):\n"
-    "BASELINE (hijau) = sesuai kondisi awal, tidak ada indikasi perubahan\n"
-    "ELEVATED (kuning) = ada peningkatan pola tension - bisa krn gugup, berpikir keras, tidak nyaman, dll\n"
-    "HIGH (merah) = peningkatan pola tension yang signifikan\n"
-    "PENTING: BUKAN alat deteksi kebohongan. Gunakan sebagai bahan pertimbangan tambahan, bukan bukti tunggal."
-)
-legend_display = legend_ax.text(
-    0.01, 0.95, legend_text, fontsize=6.5, va="top", ha="left",
-    transform=legend_ax.transAxes, linespacing=1.4,
+legend_ax.text(
+    0.5, 0.92,
+    "Panduan Level Tension (dibanding baseline/kondisi awal target)",
+    fontsize=8, color="black", fontweight="bold", va="top", ha="center", transform=legend_ax.transAxes
 )
 
+legend_ax.text(0.01, 0.74, "BASELINE", fontsize=8, color="#2e7d32", va="top", ha="left", transform=legend_ax.transAxes)
+legend_ax.text(0.105, 0.74, " = Sesuai kondisi awal - menandai ekspresi normal/netral.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
+
+legend_ax.text(0.01, 0.56, "ELEVATED", fontsize=8, color="#c77700", va="top", ha="left", transform=legend_ax.transAxes)
+legend_ax.text(0.105, 0.56, " = Peningkatan pola tension - bisa karena gugup, berpikir keras, tidak nyaman, dll", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
+
+legend_ax.text(0.01, 0.38, "HIGH", fontsize=8, color="#b00020", va="top", ha="left", transform=legend_ax.transAxes)
+legend_ax.text(0.105, 0.38, " = Peningkatan pola tension yang signifikan - terindikasi tekanan tinggi.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
+
+# Posisi PENTING diatur pada y = 0.20 untuk memberi jarak dari garis bawah (y = 0.0)
+legend_ax.text(0.01, 0.20, "PENTING", fontsize=8, color="#b00020", fontweight="bold", va="top", ha="left", transform=legend_ax.transAxes)
+legend_ax.text(0.074, 0.20, "-  Ini adalah ringkasan pola, BUKAN kesimpulan kejujuran/kebohongan target. Gunakan sebagai bahan pertimbangan tambahan, bukan bukti tunggal.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
+
+
+# radio_ax = plt.axes([0.73, 0.75, 0.13, 0.15])
+# gauge_ax = plt.axes([0.90, 0.22, 0.06, 0.68])
+indicator_ax = plt.axes([0.73, 0.065, 0.23, 0.115])
+indicator_ax.set_xticks([])
+indicator_ax.set_yticks([])
+indicator_ax.set_frame_on(True)
+
+indicator_ax.text(
+    0.5, 0.92,
+    "Indikator yang dihitung",
+    fontsize=8, color="black", fontweight="bold", va="top", ha="center",
+    transform=indicator_ax.transAxes,
+)
+
+indicator_text = (
+    "AU04_r  0.228  brow lowerer\n"
+    "AU09_r  0.192  nose wrinkler\n"
+    "AU10_r  0.181  upper lip raiser\n"
+    "AU20_r  0.146  lip stretcher\n"
+    "AU15_r  0.131  lip corner depressor\n"
+    "AU05_r  0.122  upper lid raiser"
+)
+indicator_ax.text(
+    0.04, 0.74,
+    indicator_text,
+    fontsize=6.5, color="black", va="top", ha="left",
+    family="monospace", linespacing=1.25,
+    transform=indicator_ax.transAxes,
+)
 
 # ---------------------------------------------------------------------------
 # Timeframe selector - controls how often the expression/tension summary
@@ -485,14 +579,20 @@ def on_timeframe_change(label):
     global selected_timeframe_seconds, last_conclusion_bucket
     selected_timeframe_seconds = TIMEFRAME_OPTIONS[label]
     last_conclusion_bucket = -1  # force a fresh summary on the next full window
-    conclusion_prefix_text.set_text("Menunggu data\ntimeframe penuh...")
+    conclusion_prefix_text.set_text("Menunggu data timeframe penuh...")
     conclusion_level_text.set_text("")
+    conclusion_level_text.set_visible(True)
+    session_elevated_text.set_visible(False)
+    session_elevated_count_text.set_visible(False)
+    session_separator_text.set_visible(False)
+    session_high_text.set_visible(False)
+    session_high_count_text.set_visible(False)
     conclusion_detail_text.set_text("")
     conclusion_note_text.set_text("")
     fig.canvas.draw_idle()
 
 
-radio_ax = plt.axes([0.73, 0.68, 0.13, 0.15])
+radio_ax = plt.axes([0.73, 0.75, 0.13, 0.15])
 radio_ax.set_title("Timeframe", fontsize=9)
 timeframe_radio = RadioButtons(radio_ax, list(TIMEFRAME_OPTIONS.keys()), active=list(TIMEFRAME_OPTIONS.keys()).index(DEFAULT_TIMEFRAME_LABEL))
 timeframe_radio.on_clicked(on_timeframe_change)
@@ -503,7 +603,7 @@ timeframe_radio.on_clicked(on_timeframe_change)
 # individual component features, so the voice channel isn't a silent
 # black box running in the background
 # ---------------------------------------------------------------------------
-voice_panel_ax = plt.axes([0.73, 0.33, 0.13, 0.32])
+voice_panel_ax = plt.axes([0.73, 0.40, 0.13, 0.32])
 voice_panel_ax.set_title("Voice Channel", fontsize=9)
 voice_panel_ax.set_xticks([])
 voice_panel_ax.set_yticks([])
@@ -552,7 +652,7 @@ def update_voice_panel():
 # recent value and slowly decays back down. Meant to be readable at a
 # glance, complementing the full line chart rather than replacing it.
 # ---------------------------------------------------------------------------
-gauge_ax = plt.axes([0.90, 0.15, 0.06, 0.68])
+gauge_ax = plt.axes([0.90, 0.22, 0.06, 0.68])
 gauge_ax.set_title("Now", fontsize=9)
 gauge_ax.set_xticks([])
 gauge_ax.set_xlim(0, 1)
@@ -619,14 +719,14 @@ def update_gauge():
 # window. Positioned in the right-hand column, directly under the Voice
 # Channel panel, and color-coded to match the current tension level.
 # ---------------------------------------------------------------------------
-summary_panel_ax = plt.axes([0.73, 0.15, 0.13, 0.15])
+summary_panel_ax = plt.axes([0.73, 0.22, 0.13, 0.15])
 summary_panel_ax.set_title("Summary", fontsize=9)
 summary_panel_ax.set_xticks([])
 summary_panel_ax.set_yticks([])
 
 conclusion_prefix_text = summary_panel_ax.text(
     0.03, 0.95,
-    "Menunggu data\ntimeframe penuh...",
+    "Menunggu data timeframe penuh...",
     fontsize=8, wrap=True, va="top", ha="left",
     transform=summary_panel_ax.transAxes,
 )
@@ -635,6 +735,26 @@ conclusion_level_text = summary_panel_ax.text(
     "",
     fontsize=8, fontweight="bold", wrap=True, va="top", ha="left",
     transform=summary_panel_ax.transAxes,
+)
+session_elevated_text = summary_panel_ax.text(
+    0.03, 0.68, "", fontsize=8, fontweight="bold", color="#c77700",
+    va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
+)
+session_elevated_count_text = summary_panel_ax.text(
+    0.32, 0.68, "", fontsize=8, fontweight="bold", color="black",
+    va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
+)
+session_separator_text = summary_panel_ax.text(
+    0.45, 0.68, "|", fontsize=8, fontweight="bold", color="black",
+    va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
+)
+session_high_text = summary_panel_ax.text(
+    0.53, 0.68, "", fontsize=8, fontweight="bold", color="#b00020",
+    va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
+)
+session_high_count_text = summary_panel_ax.text(
+    0.70, 0.68, "", fontsize=8, fontweight="bold", color="black",
+    va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
 )
 conclusion_detail_text = summary_panel_ax.text(
     0.03, 0.50,
@@ -695,16 +815,16 @@ def update_conclusion():
 
     if mean_val >= HIGH_THRESHOLD:
         level = "HIGH"
-        note = "Peningkatan signifikan dari baseline. Bisa banyak sebab - konfirmasi via percakapan langsung."
+        note = "Peningkatan signifikan dari baseline."
     elif mean_val >= ELEVATED_THRESHOLD:
         level = "ELEVATED"
-        note = "Ada peningkatan dari baseline. Belum tentu berarti masalah - bisa krn gugup wajar, dll."
+        note = "Ada peningkatan dari baseline.\nBelum tentu berarti masalah\nbisa krn gugup wajar, dll."
     elif mean_val <= -ELEVATED_THRESHOLD:
         level = "BELOW BASELINE"
         note = "Lebih tenang dari kondisi awal target."
     else:
         level = "BASELINE"
-        note = "Sesuai kondisi awal target, tidak ada indikasi perubahan."
+        note = "Sesuai kondisi awal target,\ntidak ada indikasi perubahan."
 
     variability_note = ""
     if std_val >= HIGH_VARIABILITY_THRESHOLD:
