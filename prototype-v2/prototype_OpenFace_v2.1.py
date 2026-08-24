@@ -251,7 +251,7 @@ visual_line, = ax.plot([], [], color='#1565c0', linewidth=1.0, alpha=0.6, zorder
 voice_line, = ax.plot([], [], color='#2e7d32', linewidth=1.0, alpha=0.6, zorder=4, label="Voice only")
 ax.set_xlabel("Time (s)")
 ax.set_ylabel("Tension Score (relative to baseline)")
-ax.set_title("Live Tension Monitor - PROTOTYPE")
+ax.set_title("Live Tension Monitor - PROTOTYPE v2.1")
 ax.axhline(0, color='gray', linestyle='--', linewidth=1)
 
 
@@ -350,7 +350,7 @@ def start_openface(event):
     session_high_count_text.set_visible(False)
 
     session_started = True
-    ax.set_title("Live Tension Monitor - PROTOTYPE (calibrating baseline...)")
+    ax.set_title("Live Tension Monitor - PROTOTYPE v2.1 (calibrating baseline...)")
     start_button.label.set_text("Running...")
     fig.canvas.draw_idle()
     print("OpenFace launched. Calibrating baseline - please stay neutral...")
@@ -940,7 +940,7 @@ def update_plot(frame_num):
                 visual_baseline_mean = np.mean(visual_baseline_scores)
                 voice_baseline_mean = np.mean(voice_baseline_scores)
                 baseline_established = True
-                ax.set_title("Live Tension Monitor - PROTOTYPE")
+                ax.set_title("Live Tension Monitor - PROTOTYPE v2.1")
                 print(f"Baseline established: {baseline_mean:.3f} (from {len(baseline_scores)} frames)")
             continue
 
