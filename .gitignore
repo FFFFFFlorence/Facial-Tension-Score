@@ -1,15 +1,24 @@
 .venv/
-Simmilar Projects - References/
-Real-life Deception Detection Dataset With Train Test/
+.Simmilar Projects - References/
+runTest.txt/
 
-#Trial_1
-Trial_1/.ipynb_checkpoints/
-Trial_1/.venv/
-Trial_1/images/
+#Trial-Model
+Trial-Model/.ipynb_checkpoints/
+Trial-Model/.venv/
+Trial-Model/images/
+Trial-Model/dump/
+Trial-Model/Real-life Deception Detection Dataset With Train Test/
 
-#Trial_2
-Trial_2 - prototype/.ipynb_checkpoints/
-Trial_2 - prototype/.venv-feat/
-Trial_2 - prototype/.venv-openface/
-Trial_2 - prototype/dump/
-Trial_2 - prototype/train/
+#prototype-v1
+prototype-v1/.ipynb_checkpoints/
+prototype-v1/.venv-feat/
+prototype-v1/.venv-openface/
+prototype-v1/dump/
+prototype-v1/train/
+prototype-v1/__pycache__/
+
+#prototype-v2
+prototype-v2/.ipynb_checkpoints/
+prototype-v2/.venv-openface02/
+prototype-v2/dump/
+prototype-v2/__pycache__/
