@@ -1,0 +1,55 @@
+TENSION WEIGHTS REFERENCE
+==========================
+
+The tension score uses six facial Action Units (AUs) from OpenFace. Each
+weight controls how strongly that AU contributes to the visual tension score.
+
+FACIAL ACTION UNITS
+-------------------
+
+AU04_r  0.228  Brow lowerer
+AU09_r  0.192  Nose wrinkler
+AU10_r  0.181  Upper lip raiser
+AU20_r  0.146  Lip stretcher
+AU15_r  0.131  Lip corner depressor
+AU05_r  0.122  Upper lid raiser
+
+The weights are data-derived from Cohen's d effect sizes calculated with the
+project's facial-expression dataset. They are normalized coefficients, not
+percentages. A higher weight means that the AU showed a stronger independent
+ability to distinguish tense-associated expressions from baseline expressions.
+
+SCORING FORMULA
+---------------
+
+AU score =
+		(AU04_r * 0.228) +
+		(AU09_r * 0.192) +
+		(AU10_r * 0.181) +
+		(AU20_r * 0.146) +
+		(AU15_r * 0.131) +
+		(AU05_r * 0.122)
+
+Gaze variability is added to the facial channel:
+
+Visual score = AU score + (gaze variance * 0.30)
+
+The visual and voice channels are then combined:
+
+Combined score = (visual score * 0.75) + (voice score * 0.25)
+
+with the percentage of facial weight being 75% : and audio weight being 25%
+
+The displayed tension value is relative to the target's baseline. During the
+first 10 seconds of a session, the program collects baseline readings while
+the target is expected to remain neutral. The baseline mean is subtracted from
+later combined scores. The displayed score is smoothed using the most recent
+10 readings.
+
+INTERPRETATION NOTE
+-------------------
+
+These weights describe the relative contribution of model inputs. They do not
+represent probabilities, percentages of tension, or proof of nervousness,
+dishonesty, or intent. The resulting value is a heuristic pattern summary and
+should be considered together with interview context and direct observation.
