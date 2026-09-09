@@ -1,6 +1,8 @@
 .venv/
-.Simmilar Projects - References/
-runTest.txt/
+dump/
+Deployment for testing/
+
+#Deployment for testing
 
 #Trial-Model
 Trial-Model/.ipynb_checkpoints/
@@ -22,3 +24,10 @@ prototype-v2/.ipynb_checkpoints/
 prototype-v2/.venv-openface02/
 prototype-v2/dump/
 prototype-v2/__pycache__/
+
+#prototype-v3
+prototype-v3/.ipynb_checkpoints/
+prototype-v3/.venv-openface03/
+prototype-v3/dump/
+prototype-v3/__pycache__/
+prototype-v3/facial recognition/

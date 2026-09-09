@@ -354,6 +354,8 @@ def start_openface(event):
             OPENFACE_EXE, "-device", "0",
             "-out_dir", OPENFACE_OUT_DIR,
             "-of", "session1",
+            # "-cam_width", "150",   # smaller capture/display resolution
+            # "-cam_height", "150",  # reduces CPU load, still enough for AU detection
         ])
     except FileNotFoundError:
         ax.set_title(f"ERROR: OpenFace exe not found at {OPENFACE_EXE}")
@@ -401,7 +403,7 @@ def start_openface(event):
         vline.remove()
     manual_event_lines.clear()
     log_rows = []
-    conclusion_prefix_text.set_text("Menunggu data timeframe penuh...")
+    conclusion_prefix_text.set_text("Menunggu data timeframe...")
     conclusion_level_text.set_text("")
     conclusion_level_text.set_visible(True)
     conclusion_detail_text.set_text("")
@@ -476,9 +478,9 @@ def stop_openface(event):
         conclusion_prefix_text.set_text("RINGKASAN SESI:")
         conclusion_level_text.set_visible(False)
         session_elevated_text.set_text("Elevated")
-        session_elevated_count_text.set_text(f" {stats['ELEVATED']['count']}x")
+        session_elevated_count_text.set_text(f"{stats['ELEVATED']['count']}x")
         session_high_text.set_text("High")
-        session_high_count_text.set_text(f" {stats['HIGH']['count']}x")
+        session_high_count_text.set_text(f"{stats['HIGH']['count']}x")
         session_elevated_text.set_visible(True)
         session_elevated_count_text.set_visible(True)
         session_separator_text.set_visible(True)
@@ -578,7 +580,7 @@ def toggle_voice(label):
 
 
 # voice_toggle_ax = plt.axes([0.686, 0.39, 0.36, 0.06])
-voice_toggle_ax = plt.axes([0.548, 0.18, 0.36, 0.06])
+voice_toggle_ax = plt.axes([0.547, 0.18, 0.36, 0.06])
 voice_toggle_ax.set_zorder(10)
 voice_toggle_ax.set_frame_on(False)
 
@@ -623,7 +625,7 @@ legend_ax.text(0.01, 0.74, "BASELINE", fontsize=8, color="#2e7d32", va="top", ha
 legend_ax.text(0.105, 0.74, " = Sesuai kondisi awal - menandai ekspresi normal/netral.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
 
 legend_ax.text(0.01, 0.56, "ELEVATED", fontsize=8, color="#c77700", va="top", ha="left", transform=legend_ax.transAxes)
-legend_ax.text(0.105, 0.56, " = Peningkatan pola tension - bisa karena gugup, berpikir keras, tidak nyaman, dll", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
+legend_ax.text(0.105, 0.56, " = Peningkatan pola tension - bisa karena gugup, berpikir keras, tidak nyaman, dll.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
 
 legend_ax.text(0.01, 0.38, "HIGH", fontsize=8, color="#b00020", va="top", ha="left", transform=legend_ax.transAxes)
 legend_ax.text(0.105, 0.38, " = Peningkatan pola tension yang signifikan - terindikasi tekanan tinggi.", fontsize=8, color="black", va="top", ha="left", transform=legend_ax.transAxes)
@@ -676,7 +678,7 @@ def on_timeframe_change(label):
     global selected_timeframe_seconds, last_conclusion_bucket
     selected_timeframe_seconds = TIMEFRAME_OPTIONS[label]
     last_conclusion_bucket = -1  # force a fresh summary on the next full window
-    conclusion_prefix_text.set_text("Menunggu data timeframe penuh...")
+    conclusion_prefix_text.set_text("Menunggu data timeframe...")
     conclusion_level_text.set_text("")
     conclusion_level_text.set_visible(True)
     session_elevated_text.set_visible(False)
@@ -879,7 +881,7 @@ summary_panel_ax.set_yticks([])
 
 conclusion_prefix_text = summary_panel_ax.text(
     0.03, 0.95,
-    "Menunggu data timeframe penuh...",
+    "Menunggu data timeframe...",
     fontsize=8, wrap=True, va="top", ha="left",
     transform=summary_panel_ax.transAxes,
 )
@@ -894,19 +896,19 @@ session_elevated_text = summary_panel_ax.text(
     va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
 )
 session_elevated_count_text = summary_panel_ax.text(
-    0.32, 0.68, "", fontsize=8, fontweight="bold", color="black",
+    0.21, 0.68, "", fontsize=8, fontweight="bold", color="black",
     va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
 )
 session_separator_text = summary_panel_ax.text(
-    0.45, 0.68, "|", fontsize=8, fontweight="bold", color="black",
+    0.29, 0.68, "|", fontsize=8, fontweight="bold", color="black",
     va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
 )
 session_high_text = summary_panel_ax.text(
-    0.53, 0.68, "", fontsize=8, fontweight="bold", color="#b00020",
+    0.34, 0.68, "", fontsize=8, fontweight="bold", color="#b00020",
     va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
 )
 session_high_count_text = summary_panel_ax.text(
-    0.70, 0.68, "", fontsize=8, fontweight="bold", color="black",
+    0.45, 0.68, "", fontsize=8, fontweight="bold", color="black",
     va="top", ha="left", transform=summary_panel_ax.transAxes, visible=False,
 )
 conclusion_detail_text = summary_panel_ax.text(
