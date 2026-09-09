@@ -1,0 +1,8 @@
+﻿# Core scoring and dashboard dependencies
+numpy==2.4.6
+pandas==3.0.5
+matplotlib==3.11.1
+
+# Voice analyzer dependencies
+sounddevice==0.5.5
+praat-parselmouth==0.4.7
