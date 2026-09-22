@@ -3,7 +3,7 @@
 ### **Installation steps for testing** 
 
 **1. Download all dependencies** 
-   - Download the [prototype_OpenFace_v2.3.zip](</Deployment for testing/prototype_OpenFace_v2.3.zip?raw=true>) file from [Deployment for testing](</Deployment for testing>) folder. Extract the **.zip** file into the local directory. 
+   - Download the [prototype_OpenFace_v3.2.zip](</Deployment for testing/prototype_OpenFace_v3.2.zip?raw=true>) file from [Deployment for testing](</Deployment for testing>) folder. Extract the **.zip** file into the local directory. 
    - **Install** [**Python 3.11**](https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe). During installation, check **"Add python.exe to PATH"**.  
      To verify, open **cmd** and run:
      ```powershell
