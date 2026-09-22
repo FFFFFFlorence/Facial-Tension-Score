@@ -76,12 +76,11 @@ WEBCAM_DEVICE_INDEX = 0  # matches the "-device" index passed to OpenFace below
 ARCFACE_MODEL_NAME = "ArcFace"
 ARCFACE_DETECTOR_BACKEND = "retinaface"
 
-# Reference/placeholder database: a folder of photos, each with a
-# same-named .json file holding that person's info fields. REPLACE
-# find_target_in_database() below with your real backend when ready -
-# this folder-based version exists so the feature is testable now.
-# Use enroll_test_subject.py to add real test entries to this folder.
-FACE_DATABASE_DIR = r"C:\FaceDatabase\known_faces"
+# Database is intentionally disabled until a real backend is connected.
+# The folder-based path below is a placeholder only for testing and is not
+# used while the system is not connected to an actual database.
+FACE_DATABASE_ENABLED = False
+FACE_DATABASE_DIR = ""
 
 GAZE_WINDOW = 30            # frames used for gaze variance calculation
 
@@ -447,53 +446,6 @@ def _grab_clean_webcam_frame(device_index=0, warmup_frames=3):
     return frame if ret else None
 
 
-# ---------------------------------------------------------------------------
-# Tension-episode snapshots (WEBCAM-GRAB VARIANT) - takes a photo the
-# instant tension crosses INTO ELEVATED or HIGH (not continuously while
-# active), so an expert can see exactly what the face looked like at each
-# rise, not just that a number crossed a threshold.
-#
-# This variant reuses _grab_clean_webcam_frame() above - a brief, separate
-# cv2.VideoCapture open-grab-release. Unlike the identity lookup's use of
-# the same helper (which runs BEFORE OpenFace claims the device), this
-# runs MID-SESSION, competing with OpenFace for a device it already holds
-# exclusively. Whether this succeeds depends entirely on your webcam
-# driver - test this on your actual hardware. If it fails, you'll see a
-# console message and no snapshot for that episode, but the session
-# continues normally either way. The upside if it works: a genuinely
-# clean, unannotated photo (no tracking overlay).
-#
-# Snapshots are saved per-session, in their own subfolder named after
-# session_id - the SAME identifier used for that session's log CSV and
-# report, so the folder and the files it belongs to are always obviously
-# connected (session_id is generated once, in start_openface, not
-# recomputed per snapshot or per file).
-# ---------------------------------------------------------------------------
-SNAPSHOT_OUT_DIR = r"C:\OpenFace\live_output\snapshots"
-session_id = None       # set once per session in start_openface, e.g. "20260908_182023"
-tension_snapshots = []  # (elapsed_seconds, level, saved_path) - persisted into the log at Stop
-
-
-def save_tension_snapshot(level, elapsed):
-    frame = _grab_clean_webcam_frame(WEBCAM_DEVICE_INDEX)
-    if frame is None:
-        print(f"Could not capture snapshot for {level} episode at {elapsed:.0f}s "
-              f"(webcam likely unavailable while OpenFace holds it)")
-        return
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    session_dir = os.path.join(SNAPSHOT_OUT_DIR, f"session_{session_id}")
-    os.makedirs(session_dir, exist_ok=True)
-    filename = f"{level}_{elapsed:.0f}s_{timestamp}.jpg"
-    path = os.path.join(session_dir, filename)
-    try:
-        cv2.imwrite(path, frame)
-        tension_snapshots.append((elapsed, level, path))
-        print(f"Snapshot saved for {level} episode at {elapsed:.0f}s at {timestamp}: {path}")
-    except Exception as e:
-        print(f"Could not save snapshot: {e}")
-
-
 def find_target_in_database(face_frame_bgr):
     """
     *** REPLACE THIS FUNCTION with your real database lookup. ***
@@ -511,6 +463,10 @@ def find_target_in_database(face_frame_bgr):
     import json
     import tempfile
     from deepface import DeepFace  # lazy import - see the note near the top imports
+
+    if not FACE_DATABASE_ENABLED or not FACE_DATABASE_DIR:
+        print("Face database lookup is disabled: no real database is connected yet.")
+        return None
 
     if not os.path.isdir(FACE_DATABASE_DIR):
         print(f"Face database folder not found: {FACE_DATABASE_DIR}")
@@ -665,13 +621,9 @@ def start_openface(event):
     global level_tracker
     global visual_baseline_mean, voice_baseline_mean
     global target_record, target_photo_image_artist
-    global session_id
 
     if session_started:
         return  # already running, ignore repeated clicks
-
-    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tension_snapshots.clear()
 
     target_record = None
     _identity_lookup_result[0] = None  # discard any stale/in-flight result from a previous session
@@ -809,15 +761,7 @@ def stop_openface(event):
             nearest_idx = (log_df["elapsed_seconds"] - ev_elapsed).abs().idxmin()
             log_df.loc[nearest_idx, "manual_event"] = ev_label
 
-        # Tag the log row closest to each tension-episode snapshot, so an
-        # expert can jump straight from a row to the actual photo taken
-        # at that rise.
-        log_df["tension_snapshot"] = ""
-        for snap_elapsed, snap_level, snap_path in tension_snapshots:
-            nearest_idx = (log_df["elapsed_seconds"] - snap_elapsed).abs().idxmin()
-            log_df.loc[nearest_idx, "tension_snapshot"] = os.path.basename(snap_path)
-
-        stamped_path = LOG_PATH.replace(".csv", f"_{session_id}.csv")
+        stamped_path = LOG_PATH.replace(".csv", f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         log_df.to_csv(stamped_path, index=False)
         print(f"Session log saved to {stamped_path} ({len(log_df)} rows)")
         ax.set_title(f"Stopped. Log saved: {os.path.basename(stamped_path)}")
@@ -898,18 +842,6 @@ CATATAN OPERATOR
                           kosong. Pakai ini untuk mencocokkan lonjakan
                           skor dengan momen spesifik yang dicatat operator
                           (mis. "pertanyaan baru diajukan").
-
-FOTO OTOMATIS
-  tension_snapshot        Nama file foto yang diambil OTOMATIS tepat saat
-                          skor naik masuk ke ELEVATED atau HIGH (bukan
-                          difoto terus-menerus selama level itu aktif,
-                          hanya di titik awal kenaikannya). File foto ada
-                          di folder snapshots/session_<ID>/ - <ID> yang
-                          sama seperti pada nama file log/report ini,
-                          jadi satu folder foto = satu sesi ini saja.
-                          Buka file ini untuk melihat langsung ekspresi
-                          wajah pada momen tersebut. Baris lain (tanpa
-                          kenaikan level) kosong.
 
 PENTING: Semua ini adalah ringkasan pola heuristik, BUKAN kesimpulan
 kejujuran/kebohongan target. Gunakan sebagai salah satu bahan
@@ -1611,10 +1543,7 @@ def update_plot(frame_num):
         tension_history.append(relative_score)
         smoothed = sum(tension_history) / len(tension_history)
 
-        was_active_level = level_tracker.active_level
         level_tracker.update(elapsed, smoothed)
-        if level_tracker.active_level is not None and level_tracker.active_level != was_active_level:
-            save_tension_snapshot(level_tracker.active_level, elapsed)
 
         # per-channel relative + smoothed scores, purely for the secondary
         # display lines - doesn't feed back into the combined score at all
@@ -1730,8 +1659,7 @@ if voice_analyzer:
 
 if session_started and log_rows:
     log_df = pd.DataFrame(log_rows)
-    fallback_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    stamped_path = LOG_PATH.replace(".csv", f"_{fallback_id}.csv")
+    stamped_path = LOG_PATH.replace(".csv", f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     log_df.to_csv(stamped_path, index=False)
     print(f"Session log saved to {stamped_path} ({len(log_df)} rows)")
 elif not session_started:
