@@ -20,8 +20,12 @@ from voice_analyzer import VoiceAnalyzer  # separate file, as requested
 # ---------------------------------------------------------------------------
 # Original config - unchanged
 # ---------------------------------------------------------------------------
-CSV_PATH = r"C:\OpenFace\live_output\session1.csv"
-LOG_PATH = r"C:\OpenFace\live_output\tension_log.csv"
+# CSV_PATH and LOG_PATH used to be fixed, flat paths shared across every
+# session (overwritten/stamped-by-suffix each run). They're now computed
+# PER SESSION instead, under a dedicated session_<ID>/ folder - see
+# session_dir, current_csv_path, current_log_path, current_snapshot_dir
+# (all set in start_openface(), near OPENFACE_OUT_DIR below) and
+# GUIDE_PATH (the one exception: a single shared file, not per-session).
 
 TENSION_WEIGHTS = {
     # Replaced from the original hand-picked guess with data-derived weights,
@@ -65,8 +69,33 @@ BASELINE_DURATION_SECONDS = 10
 # New config - OpenFace launch + gaze + voice + threshold zones
 # ---------------------------------------------------------------------------
 OPENFACE_EXE = r"C:\OpenFace\OpenFace_2.2.0_win_x64\FeatureExtraction.exe"
-OPENFACE_OUT_DIR = r"C:\OpenFace\live_output"
 WEBCAM_DEVICE_INDEX = 0  # matches the "-device" index passed to OpenFace below
+
+# ---------------------------------------------------------------------------
+# Output layout - one folder per session, everything that session produced
+# lives inside it:
+#
+#   C:\OpenFace\live_output\
+#   |-- panduan_kolom.txt                  <- ONE shared copy, not per-session
+#   `-- session_20260908_182023\
+#       |-- session1.csv / .hog / .avi / session1_aligned\   (OpenFace's own output)
+#       |-- tension_log.csv
+#       |-- report.txt
+#       `-- snapshots\
+#           |-- BASELINE_12.05s_20260908_182035.jpg
+#           `-- ...
+#
+# session_dir and the current_*_path globals below are only valid while a
+# session is running/just finished - they're (re)computed once per session,
+# in start_openface(), the same place session_id itself is generated.
+# ---------------------------------------------------------------------------
+OPENFACE_OUT_DIR = r"C:\OpenFace\live_output"          # base dir: holds the shared guide + one subfolder per session
+GUIDE_PATH = os.path.join(OPENFACE_OUT_DIR, "panduan_kolom.txt")  # shared across all sessions - written once, not regenerated per run
+
+session_dir = None             # OPENFACE_OUT_DIR/session_<id> - this session's own folder
+current_csv_path = None        # session_dir/session1.csv - OpenFace's own output
+current_log_path = None        # session_dir/tension_log.csv
+current_snapshot_dir = None    # session_dir/snapshots
 
 # ---------------------------------------------------------------------------
 # Identity lookup config - separate feature from tension scoring (facial
@@ -463,13 +492,11 @@ def _grab_clean_webcam_frame(device_index=0, warmup_frames=3):
 # continues normally either way. The upside if it works: a genuinely
 # clean, unannotated photo (no tracking overlay).
 #
-# Snapshots are saved per-session, in their own subfolder named after
-# session_id - the SAME identifier used for that session's log CSV and
-# report, so the folder and the files it belongs to are always obviously
-# connected (session_id is generated once, in start_openface, not
-# recomputed per snapshot or per file).
+# Snapshots are saved inside THIS session's own folder (session_dir/
+# snapshots/, set in start_openface) - same place as that session's log
+# CSV and report, so one session's files are never scattered across
+# session-ID-named subfolders in a separate top-level snapshots/ tree.
 # ---------------------------------------------------------------------------
-SNAPSHOT_OUT_DIR = r"C:\OpenFace\live_output\snapshots"
 session_id = None       # set once per session in start_openface, e.g. "20260908_182023"
 tension_snapshots = []  # (elapsed_seconds, level, saved_path) - persisted into the log at Stop
 
@@ -482,10 +509,9 @@ def save_tension_snapshot(level, elapsed):
         return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    session_dir = os.path.join(SNAPSHOT_OUT_DIR, f"session_{session_id}")
-    os.makedirs(session_dir, exist_ok=True)
+    os.makedirs(current_snapshot_dir, exist_ok=True)
     filename = f"{level}_{elapsed:.0f}s_{timestamp}.jpg"
-    path = os.path.join(session_dir, filename)
+    path = os.path.join(current_snapshot_dir, filename)
     try:
         cv2.imwrite(path, frame)
         tension_snapshots.append((elapsed, level, path))
@@ -665,12 +691,16 @@ def start_openface(event):
     global level_tracker
     global visual_baseline_mean, voice_baseline_mean
     global target_record, target_photo_image_artist
-    global session_id
+    global session_id, session_dir, current_csv_path, current_log_path, current_snapshot_dir
 
     if session_started:
         return  # already running, ignore repeated clicks
 
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.join(OPENFACE_OUT_DIR, f"session_{session_id}")
+    current_csv_path = os.path.join(session_dir, "session1.csv")
+    current_log_path = os.path.join(session_dir, "tension_log.csv")
+    current_snapshot_dir = os.path.join(session_dir, "snapshots")
     tension_snapshots.clear()
 
     target_record = None
@@ -686,14 +716,11 @@ def start_openface(event):
         pass  # not worth failing Start over a cosmetic reset
 
     os.makedirs(OPENFACE_OUT_DIR, exist_ok=True)
-
-    # remove any stale CSV from a previous run so the baseline calibration
-    # window reflects genuinely fresh data, not old leftover rows
-    try:
-        if os.path.exists(CSV_PATH):
-            os.remove(CSV_PATH)
-    except Exception as e:
-        print(f"Could not remove old CSV (continuing anyway): {e}")
+    os.makedirs(session_dir, exist_ok=True)
+    # No more stale-CSV cleanup needed here: each session gets its own
+    # fresh, uniquely-timestamped session_dir, so current_csv_path can
+    # never already exist from a previous run the way the old flat,
+    # shared CSV_PATH could.
 
     # Run the identity lookup BEFORE launching OpenFace, not after. OpenFace
     # opens the webcam device exclusively for the whole session, so grabbing
@@ -707,7 +734,7 @@ def start_openface(event):
     try:
         openface_process = subprocess.Popen([
             OPENFACE_EXE, "-device", "0",
-            "-out_dir", OPENFACE_OUT_DIR,
+            "-out_dir", session_dir,
             "-of", "session1",
             # "-cam_width", "150",   # smaller capture/display resolution
             # "-cam_height", "150",  # reduces CPU load, still enough for AU detection
@@ -817,16 +844,14 @@ def stop_openface(event):
             nearest_idx = (log_df["elapsed_seconds"] - snap_elapsed).abs().idxmin()
             log_df.loc[nearest_idx, "tension_snapshot"] = os.path.basename(snap_path)
 
-        stamped_path = LOG_PATH.replace(".csv", f"_{session_id}.csv")
-        log_df.to_csv(stamped_path, index=False)
-        print(f"Session log saved to {stamped_path} ({len(log_df)} rows)")
-        ax.set_title(f"Stopped. Log saved: {os.path.basename(stamped_path)}")
+        log_df.to_csv(current_log_path, index=False)
+        print(f"Session log saved to {current_log_path} ({len(log_df)} rows)")
+        ax.set_title(f"Stopped. Log saved: {os.path.basename(session_dir)}/{os.path.basename(current_log_path)}")
 
         # Plain-language column guide, saved alongside the CSV - the log
         # is meant to be handed to a domain expert for validation, who
         # may not know FACS AU codes or this project's internal scoring
         # terms, so the raw column headers alone aren't self-explanatory.
-        guide_path = stamped_path.replace(".csv", "_panduan_kolom.txt")
         column_guide = """PANDUAN KOLOM - tension_log
 ============================================
 
@@ -904,23 +929,36 @@ FOTO OTOMATIS
                           skor naik masuk ke ELEVATED atau HIGH (bukan
                           difoto terus-menerus selama level itu aktif,
                           hanya di titik awal kenaikannya). File foto ada
-                          di folder snapshots/session_<ID>/ - <ID> yang
-                          sama seperti pada nama file log/report ini,
-                          jadi satu folder foto = satu sesi ini saja.
+                          di dalam folder "snapshots" pada folder sesi
+                          yang sama (session_<tanggal_jam>\\snapshots\\) -
+                          folder sesi yang sama juga berisi tension_log.csv
+                          dan report.txt ini, jadi satu folder sesi = satu
+                          sesi lengkap (CSV OpenFace, log, report, foto).
                           Buka file ini untuk melihat langsung ekspresi
                           wajah pada momen tersebut. Baris lain (tanpa
                           kenaikan level) kosong.
+
+CATATAN FILE INI
+  Panduan ini SATU file yang dipakai bersama untuk semua sesi (disimpan
+  di folder utama C:\\OpenFace\\live_output\\, bukan di dalam folder
+  sesi masing-masing), karena isinya sama untuk setiap sesi.
 
 PENTING: Semua ini adalah ringkasan pola heuristik, BUKAN kesimpulan
 kejujuran/kebohongan target. Gunakan sebagai salah satu bahan
 pertimbangan tambahan bersama observasi langsung dan konteks wawancara.
 """
-        try:
-            with open(guide_path, "w", encoding="utf-8") as f:
-                f.write(column_guide)
-            print(f"Column guide saved to {guide_path}")
-        except Exception as e:
-            print(f"Could not save column guide: {e}")
+        # Shared across every session - written once, not regenerated (and
+        # not overwritten) on each run, since its content doesn't depend
+        # on any particular session.
+        if not os.path.exists(GUIDE_PATH):
+            try:
+                with open(GUIDE_PATH, "w", encoding="utf-8") as f:
+                    f.write(column_guide)
+                print(f"Column guide saved to {GUIDE_PATH}")
+            except Exception as e:
+                print(f"Could not save column guide: {e}")
+        else:
+            print(f"Column guide already exists at {GUIDE_PATH} (shared across sessions, not rewritten)")
 
         # ---- End-of-session episode report ----
         report_lines = [
@@ -930,15 +968,44 @@ pertimbangan tambahan bersama observasi langsung dan konteks wawancara.
             f"HIGH: {stats['HIGH']['count']}x kejadian, total {stats['HIGH']['total_duration']:.0f}s, "
             f"terlama {stats['HIGH']['longest']:.0f}s",
             "",
+        ]
+
+        # Frame-level trace: for each ELEVATED/HIGH episode, find the
+        # OpenFace frame number closest to the exact moment the episode
+        # started (same "nearest elapsed_seconds" match already used above
+        # for manual_event/tension_snapshot) - this is what actually lets
+        # someone jump to session1_aligned/frame_det_00_<frame>.* and see
+        # the aligned face crop at the instant tension rose into that level,
+        # not just a timestamp they'd have to convert themselves.
+        report_lines.append("RINCIAN FRAME SAAT TENSION NAIK KE LEVEL (untuk dicocokkan ke session1_aligned/):")
+        any_episode = False
+        for lvl in ("ELEVATED", "HIGH"):
+            for i, ep in enumerate(level_tracker.episodes[lvl], start=1):
+                any_episode = True
+                if len(log_df):
+                    nearest_idx = (log_df["elapsed_seconds"] - ep["start"]).abs().idxmin()
+                    frame_no = int(log_df.loc[nearest_idx, "frame"])
+                    frame_note = (f"frame {frame_no:06d} -> session1_aligned/frame_det_00_{frame_no:06d}.*")
+                else:
+                    frame_note = "frame tidak diketahui (log kosong)"
+                report_lines.append(
+                    f"  {lvl} #{i}: naik pada {ep['start']:.1f}s "
+                    f"(aktif sampai {ep['end']:.1f}s, durasi {ep['duration']:.1f}s) -> {frame_note}"
+                )
+        if not any_episode:
+            report_lines.append("  (tidak ada episode ELEVATED/HIGH pada sesi ini)")
+        report_lines.append("")
+
+        report_lines.append(
             "Catatan: hitungan ini menunjukkan berapa kali pola tension naik ke level tersebut "
             "secara terpisah (bukan jumlah pembacaan individual). Ini adalah ringkasan pola, "
             "BUKAN kesimpulan kejujuran/kebohongan target. Gunakan sebagai salah satu bahan "
-            "pertimbangan bersama observasi langsung dan konteks wawancara.",
-        ]
+            "pertimbangan bersama observasi langsung dan konteks wawancara."
+        )
         report_text_full = "\n".join(report_lines)
         print(report_text_full)
 
-        report_path = stamped_path.replace(".csv", "_report.txt")
+        report_path = os.path.join(session_dir, "report.txt")
         try:
             with open(report_path, "w", encoding="utf-8") as f:
                 f.write(report_text_full)
@@ -1520,10 +1587,10 @@ def update_plot(frame_num):
         return line,
 
     try:
-        if not os.path.exists(CSV_PATH):
+        if not current_csv_path or not os.path.exists(current_csv_path):
             return line,
 
-        with open(CSV_PATH, "r", newline="") as f:
+        with open(current_csv_path, "r", newline="") as f:
             if csv_header is None:
                 csv_header = f.readline()
                 csv_byte_offset = f.tell()
@@ -1605,6 +1672,11 @@ def update_plot(frame_num):
                 baseline_established = True
                 ax.set_title("Live Tension Monitor - PROTOTYPE")
                 print(f"Baseline established: {baseline_mean:.3f} (from {len(baseline_scores)} frames)")
+                # One reference photo of the "normal/neutral" state calibration
+                # was based on - same mechanism and naming convention as the
+                # ELEVATED/HIGH episode snapshots below, just triggered once
+                # here instead of on a level transition.
+                save_tension_snapshot("BASELINE", elapsed)
             continue
 
         relative_score = raw_score - baseline_mean
@@ -1730,10 +1802,16 @@ if voice_analyzer:
 
 if session_started and log_rows:
     log_df = pd.DataFrame(log_rows)
-    fallback_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    stamped_path = LOG_PATH.replace(".csv", f"_{fallback_id}.csv")
-    log_df.to_csv(stamped_path, index=False)
-    print(f"Session log saved to {stamped_path} ({len(log_df)} rows)")
+    # session_dir/current_log_path are normally already set (start_openface
+    # sets them before session_started goes True) - this fallback only
+    # matters if something unexpected left them unset.
+    if session_dir is None:
+        fallback_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_dir = os.path.join(OPENFACE_OUT_DIR, f"session_{fallback_id}")
+        os.makedirs(session_dir, exist_ok=True)
+    fallback_log_path = current_log_path or os.path.join(session_dir, "tension_log.csv")
+    log_df.to_csv(fallback_log_path, index=False)
+    print(f"Session log saved to {fallback_log_path} ({len(log_df)} rows)")
 elif not session_started:
     print("Session was already stopped and saved before the window closed.")
 else:
