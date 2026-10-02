@@ -13,27 +13,6 @@ import matplotlib.animation as animation
 from matplotlib.widgets import Button, RadioButtons, CheckButtons
 
 from voice_analyzer import VoiceAnalyzer  # separate file, as requested
-from ctypes import windll
-
-# pywin32 is used to find OpenFace's own native preview window and to
-# screen-capture its rendered content (via PrintWindow), so it can be
-# rescaled to match the main graph - resizing that window directly just
-# clips its image instead of redrawing it smaller (OpenFace's own window
-# is created in OpenCV's WINDOW_AUTOSIZE mode internally, which we can't
-# change since it's a prebuilt .exe). Optional: if pywin32 isn't
-# installed, the preview window shows a placeholder instead.
-try:
-    import win32gui
-    import win32process
-    import win32api
-    import win32con
-    import win32ui
-    HAS_WIN32 = True
-except ImportError:
-    HAS_WIN32 = False
-    print("pywin32 not installed - the OpenFace preview window will show "
-          "a placeholder instead of the live tracked video. Run "
-          "'pip install pywin32' to enable it.")
 # Note: DeepFace is imported lazily inside find_target_in_database(), not
 # here - importing it eagerly initializes TensorFlow at startup, adding a
 # real few-second delay whether or not identity lookup ever runs.
@@ -41,8 +20,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Original config - unchanged
 # ---------------------------------------------------------------------------
-CSV_PATH = r"C:\OpenFace\live_output\session1.csv"
-LOG_PATH = r"C:\OpenFace\live_output\tension_log.csv"
+# CSV_PATH and LOG_PATH used to be fixed, flat paths shared across every
+# session (overwritten/stamped-by-suffix each run). They're now computed
+# PER SESSION instead, under a dedicated session_<ID>/ folder - see
+# session_dir, current_csv_path, current_log_path, current_snapshot_dir
+# (all set in start_openface(), near OPENFACE_OUT_DIR below) and
+# GUIDE_PATH (the one exception: a single shared file, not per-session).
 
 TENSION_WEIGHTS = {
     # Replaced from the original hand-picked guess with data-derived weights,
@@ -86,22 +69,33 @@ BASELINE_DURATION_SECONDS = 10
 # New config - OpenFace launch + gaze + voice + threshold zones
 # ---------------------------------------------------------------------------
 OPENFACE_EXE = r"C:\OpenFace\OpenFace_2.2.0_win_x64\FeatureExtraction.exe"
-OPENFACE_OUT_DIR = r"C:\OpenFace\live_output"
+WEBCAM_DEVICE_INDEX = 0  # matches the "-device" index passed to OpenFace below
 
 # ---------------------------------------------------------------------------
-# OpenFace preview config (facecam panel)
+# Output layout - one folder per session, everything that session produced
+# lives inside it:
+#
+#   C:\OpenFace\live_output\
+#   |-- panduan_kolom.txt                  <- ONE shared copy, not per-session
+#   `-- session_20260908_182023\
+#       |-- session1.csv / .hog / .avi / session1_aligned\   (OpenFace's own output)
+#       |-- tension_log.csv
+#       |-- report.txt
+#       `-- snapshots\
+#           |-- BASELINE_12.05s_20260908_182035.jpg
+#           `-- ...
+#
+# session_dir and the current_*_path globals below are only valid while a
+# session is running/just finished - they're (re)computed once per session,
+# in start_openface(), the same place session_id itself is generated.
 # ---------------------------------------------------------------------------
-# OpenFace's own native preview window is moved off-screen (same native
-# size, not resized) and its content is screen-captured (PrintWindow) and
-# drawn directly into an embedded panel inside THIS figure (camera_ax,
-# defined near the other panels below) - no separate window, no
-# background thread besides its own dedicated timer. Capture happens on
-# that independent timer, not on update_plot's 500ms tick, so the facecam
-# can refresh faster than the chart without slowing it down (or vice versa).
-OPENFACE_WINDOW_FIND_TIMEOUT = 5.0        # seconds to wait for OpenFace's window to appear
-OPENFACE_WINDOW_FIND_POLL_INTERVAL = 0.25
-CAMERA_PANEL_TARGET_FPS = 20              # independent of the chart's own refresh rate
-WEBCAM_DEVICE_INDEX = 0  # matches the "-device" index passed to OpenFace below
+OPENFACE_OUT_DIR = r"C:\OpenFace\live_output"          # base dir: holds the shared guide + one subfolder per session
+GUIDE_PATH = os.path.join(OPENFACE_OUT_DIR, "panduan_kolom.txt")  # shared across all sessions - written once, not regenerated per run
+
+session_dir = None             # OPENFACE_OUT_DIR/session_<id> - this session's own folder
+current_csv_path = None        # session_dir/session1.csv - OpenFace's own output
+current_log_path = None        # session_dir/tension_log.csv
+current_snapshot_dir = None    # session_dir/snapshots
 
 # ---------------------------------------------------------------------------
 # Identity lookup config - separate feature from tension scoring (facial
@@ -278,7 +272,6 @@ log_rows = []
 
 openface_process = None
 voice_analyzer = None
-openface_hwnd = None                 # cached window handle for OpenFace's own preview window (facecam)
 target_record = None                # dict of the matched person's fields, or None
 session_started = False  # gates the update loop until the Start button is pressed
 voice_enabled = False    # toggled via the "Enable Voice Detection" checkbox - takes effect on next Start
@@ -459,187 +452,6 @@ target_info_text = target_info_ax.text(
 )
 
 
-# ---------------------------------------------------------------------------
-# Facecam panel - shows OpenFace's own live tracked-video preview, embedded
-# directly under the target-identity panel above (ported from v3.1.1).
-# Distinct from _grab_clean_webcam_frame() below: this shows what OpenFace
-# itself is seeing/tracking, on screen, continuously, for the whole
-# session - not the one-shot silent identity-lookup grab.
-# ---------------------------------------------------------------------------
-def find_and_hide_openface_window(process):
-    if not HAS_WIN32 or process is None:
-        return None
-
-    target_hwnd = [None]
-
-    def _enum_handler(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-        if not win32gui.GetWindowText(hwnd):
-            return  # skip windows with no title (helper/owned windows, not the main preview)
-        _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
-        if found_pid == process.pid:
-            target_hwnd[0] = hwnd
-
-    deadline = time.time() + OPENFACE_WINDOW_FIND_TIMEOUT
-    while time.time() < deadline:
-        win32gui.EnumWindows(_enum_handler, None)
-        if target_hwnd[0] is not None:
-            break
-        time.sleep(OPENFACE_WINDOW_FIND_POLL_INTERVAL)
-
-    if target_hwnd[0] is None:
-        print("Could not find OpenFace's preview window (it may still be "
-              "starting up, or visualization is disabled in this OpenFace "
-              "build) - the facecam panel will show a placeholder until it's found.")
-        return None
-
-    try:
-        # Move off-screen rather than SW_HIDE: Windows generally stops
-        # actively rendering/compositing a genuinely hidden window, which
-        # left PrintWindow with nothing live to capture (solid black).
-        # Off-screen keeps it "visible" as far as the rendering pipeline
-        # is concerned, so content keeps updating - this is the part that
-        # must work for the preview to show anything at all.
-        left, top, right, bottom = win32gui.GetWindowRect(target_hwnd[0])
-        width, height = right - left, bottom - top
-        win32gui.MoveWindow(target_hwnd[0], -width - 100, -height - 100, width, height, True)
-    except Exception as e:
-        print(f"Found OpenFace's window but could not move it off-screen: {e}")
-        return target_hwnd[0]
-
-    # Best-effort bonus: mark it as a "tool window" so Windows drops its
-    # taskbar/Alt-Tab entry, without touching whether it's rendered. This
-    # isn't guaranteed to take effect on a window owned by another
-    # process, so failures here are silently ignored - worst case, it's
-    # still off-screen and working, just also listed in the taskbar.
-    try:
-        ex_style = win32gui.GetWindowLong(target_hwnd[0], win32con.GWL_EXSTYLE)
-        ex_style = (ex_style | win32con.WS_EX_TOOLWINDOW) & ~win32con.WS_EX_APPWINDOW
-        win32gui.SetWindowLong(target_hwnd[0], win32con.GWL_EXSTYLE, ex_style)
-        win32gui.SetWindowPos(
-            target_hwnd[0], None, 0, 0, 0, 0,
-            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
-        )
-    except Exception:
-        pass
-
-    return target_hwnd[0]
-
-
-def capture_window_image(hwnd):
-    """Screen-scrapes a foreign window's current rendered content into a
-    BGR numpy array via PrintWindow, instead of touching that window's own
-    size/position. Best-effort: PrintWindow can return a blank capture for
-    windows using hardware-accelerated rendering on some Windows/driver
-    combinations - returns None on any failure so callers fall back to a
-    placeholder instead of crashing."""
-    if not HAS_WIN32 or hwnd is None:
-        return None
-    try:
-        if not win32gui.IsWindow(hwnd):
-            return None
-        left, top, right, bottom = win32gui.GetClientRect(hwnd)
-        w, h = right - left, bottom - top
-        if w <= 0 or h <= 0:
-            return None
-
-        hwnd_dc = win32gui.GetWindowDC(hwnd)
-        mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
-        save_dc = mfc_dc.CreateCompatibleDC()
-        bitmap = win32ui.CreateBitmap()
-        bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
-        save_dc.SelectObject(bitmap)
-
-        # flag 2 = PW_RENDERFULLCONTENT (Windows 8.1+) - helps capture
-        # windows that use DirectX/hardware-accelerated drawing surfaces
-        result = windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
-
-        bmp_info = bitmap.GetInfo()
-        bmp_bits = bitmap.GetBitmapBits(True)
-        img = np.frombuffer(bmp_bits, dtype='uint8')
-        img.shape = (bmp_info['bmHeight'], bmp_info['bmWidth'], 4)
-
-        win32gui.DeleteObject(bitmap.GetHandle())
-        save_dc.DeleteDC()
-        mfc_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwnd_dc)
-
-        if result != 1:
-            return None
-        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    except Exception:
-        return None
-
-
-# Positioned directly under the target-identity panel above (target_photo_ax
-# + target_info_ax together span x=[0.03, 0.39], y=[0.60, 0.896]) and
-# made taller while keeping the bottom edge fixed at the same y-position
-# so the camera panel aligns with the lower control row without moving it down.
-camera_ax = plt.axes([0.03, 0.25, 0.3403, 0.30])
-camera_ax.axis("off")
-camera_placeholder = np.full((240, 320, 3), 30, dtype=np.uint8)
-camera_image_artist = camera_ax.imshow(camera_placeholder, aspect="auto")
-camera_placeholder_text = camera_ax.text(
-    0.06, 0.92, "Facecam", color="White", fontsize=12,
-    ha="left", va="top", transform=camera_ax.transAxes,
-)
-for _spine in camera_ax.spines.values():
-    _spine.set_visible(True)
-    _spine.set_linewidth(1.5)
-
-
-def _crop_black_border(frame, black_thresh=10):
-    """Crops away pure-black (or near-black) margins around the actual
-    video content. OpenFace's own captured window can have unused black
-    padding baked into its client area (its window is bigger than the
-    video it actually draws) - this strips that out before we display it,
-    rather than showing it as dead space in our panel. Falls back to the
-    original frame if nothing meaningfully non-black is found."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    mask = gray > black_thresh
-    if not mask.any():
-        return frame
-    rows, cols = np.any(mask, axis=1), np.any(mask, axis=0)
-    top, bottom = np.where(rows)[0][[0, -1]]
-    left, right = np.where(cols)[0][[0, -1]]
-    if bottom <= top or right <= left:
-        return frame
-    return frame[top:bottom + 1, left:right + 1]
-
-
-def update_camera_panel():
-    """Called by its own dedicated timer (camera_timer, below) - NOT by
-    update_plot - so it can refresh at CAMERA_PANEL_TARGET_FPS regardless
-    of the chart's own tick rate. Screen-captures OpenFace's (hidden,
-    off-screen) preview window, crops its black padding, and draws it
-    stretched to completely fill camera_ax (aspect='auto', recreated each
-    call since the cropped size can vary tick to tick)."""
-    global camera_image_artist
-
-    if openface_hwnd is None:
-        return
-
-    captured = capture_window_image(openface_hwnd)
-    if captured is None:
-        return
-
-    captured = _crop_black_border(captured)
-    camera_placeholder_text.set_visible(False)
-    rgb = cv2.cvtColor(captured, cv2.COLOR_BGR2RGB)
-    camera_image_artist.remove()
-    camera_image_artist = camera_ax.imshow(rgb, aspect="auto")
-    fig.canvas.draw_idle()
-
-
-# Dedicated timer, independent of the chart's FuncAnimation - runs
-# continuously (update_camera_panel is a cheap no-op whenever
-# openface_hwnd is None, i.e. no session running).
-camera_timer = fig.canvas.new_timer(interval=int(1000 / CAMERA_PANEL_TARGET_FPS))
-camera_timer.add_callback(update_camera_panel)
-camera_timer.start()
-
-
 def _grab_clean_webcam_frame(device_index=0, warmup_frames=3):
     """Briefly opens its OWN capture of the webcam - separate from
     OpenFace's - grabs one clean frame, and immediately releases it.
@@ -680,13 +492,11 @@ def _grab_clean_webcam_frame(device_index=0, warmup_frames=3):
 # continues normally either way. The upside if it works: a genuinely
 # clean, unannotated photo (no tracking overlay).
 #
-# Snapshots are saved per-session, in their own subfolder named after
-# session_id - the SAME identifier used for that session's log CSV and
-# report, so the folder and the files it belongs to are always obviously
-# connected (session_id is generated once, in start_openface, not
-# recomputed per snapshot or per file).
+# Snapshots are saved inside THIS session's own folder (session_dir/
+# snapshots/, set in start_openface) - same place as that session's log
+# CSV and report, so one session's files are never scattered across
+# session-ID-named subfolders in a separate top-level snapshots/ tree.
 # ---------------------------------------------------------------------------
-SNAPSHOT_OUT_DIR = r"C:\OpenFace\live_output\snapshots"
 session_id = None       # set once per session in start_openface, e.g. "20260908_182023"
 tension_snapshots = []  # (elapsed_seconds, level, saved_path) - persisted into the log at Stop
 
@@ -699,10 +509,9 @@ def save_tension_snapshot(level, elapsed):
         return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    session_dir = os.path.join(SNAPSHOT_OUT_DIR, f"session_{session_id}")
-    os.makedirs(session_dir, exist_ok=True)
+    os.makedirs(current_snapshot_dir, exist_ok=True)
     filename = f"{level}_{elapsed:.0f}s_{timestamp}.jpg"
-    path = os.path.join(session_dir, filename)
+    path = os.path.join(current_snapshot_dir, filename)
     try:
         cv2.imwrite(path, frame)
         tension_snapshots.append((elapsed, level, path))
@@ -882,13 +691,16 @@ def start_openface(event):
     global level_tracker
     global visual_baseline_mean, voice_baseline_mean
     global target_record, target_photo_image_artist
-    global session_id
-    global openface_hwnd
+    global session_id, session_dir, current_csv_path, current_log_path, current_snapshot_dir
 
     if session_started:
         return  # already running, ignore repeated clicks
 
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.join(OPENFACE_OUT_DIR, f"session_{session_id}")
+    current_csv_path = os.path.join(session_dir, "session1.csv")
+    current_log_path = os.path.join(session_dir, "tension_log.csv")
+    current_snapshot_dir = os.path.join(session_dir, "snapshots")
     tension_snapshots.clear()
 
     target_record = None
@@ -904,14 +716,11 @@ def start_openface(event):
         pass  # not worth failing Start over a cosmetic reset
 
     os.makedirs(OPENFACE_OUT_DIR, exist_ok=True)
-
-    # remove any stale CSV from a previous run so the baseline calibration
-    # window reflects genuinely fresh data, not old leftover rows
-    try:
-        if os.path.exists(CSV_PATH):
-            os.remove(CSV_PATH)
-    except Exception as e:
-        print(f"Could not remove old CSV (continuing anyway): {e}")
+    os.makedirs(session_dir, exist_ok=True)
+    # No more stale-CSV cleanup needed here: each session gets its own
+    # fresh, uniquely-timestamped session_dir, so current_csv_path can
+    # never already exist from a previous run the way the old flat,
+    # shared CSV_PATH could.
 
     # Run the identity lookup BEFORE launching OpenFace, not after. OpenFace
     # opens the webcam device exclusively for the whole session, so grabbing
@@ -925,7 +734,7 @@ def start_openface(event):
     try:
         openface_process = subprocess.Popen([
             OPENFACE_EXE, "-device", "0",
-            "-out_dir", OPENFACE_OUT_DIR,
+            "-out_dir", session_dir,
             "-of", "session1",
             # "-cam_width", "150",   # smaller capture/display resolution
             # "-cam_height", "150",  # reduces CPU load, still enough for AU detection
@@ -934,13 +743,6 @@ def start_openface(event):
         ax.set_title(f"ERROR: OpenFace exe not found at {OPENFACE_EXE}")
         fig.canvas.draw_idle()
         return
-
-    # OpenFace's own preview window appears asynchronously a moment after
-    # the process starts - find it and move it off-screen (same native
-    # size, no resize). camera_timer's own independent tick screen-
-    # captures its content and draws it into camera_ax (the facecam panel).
-    openface_hwnd = find_and_hide_openface_window(openface_process)
-    camera_placeholder_text.set_visible(True)
 
     if voice_enabled:
         voice_analyzer = VoiceAnalyzer()
@@ -1003,7 +805,6 @@ def start_openface(event):
 
 def stop_openface(event):
     global openface_process, voice_analyzer, session_started
-    global openface_hwnd, camera_image_artist
 
     if not session_started:
         return  # nothing running
@@ -1016,14 +817,6 @@ def stop_openface(event):
     if voice_analyzer:
         voice_analyzer.stop()
         voice_analyzer = None
-
-    openface_hwnd = None
-    camera_placeholder_text.set_visible(True)
-    try:
-        camera_image_artist.remove()
-        camera_image_artist = camera_ax.imshow(camera_placeholder, aspect="auto")
-    except Exception:
-        pass  # not worth failing Stop over a cosmetic reset
 
     # finalize any still-active ELEVATED/HIGH episode so it's included in the report
     end_t = plot_timestamps[-1] if len(plot_timestamps) > 0 else 0.0
@@ -1051,16 +844,14 @@ def stop_openface(event):
             nearest_idx = (log_df["elapsed_seconds"] - snap_elapsed).abs().idxmin()
             log_df.loc[nearest_idx, "tension_snapshot"] = os.path.basename(snap_path)
 
-        stamped_path = LOG_PATH.replace(".csv", f"_{session_id}.csv")
-        log_df.to_csv(stamped_path, index=False)
-        print(f"Session log saved to {stamped_path} ({len(log_df)} rows)")
-        ax.set_title(f"Stopped. Log saved: {os.path.basename(stamped_path)}")
+        log_df.to_csv(current_log_path, index=False)
+        print(f"Session log saved to {current_log_path} ({len(log_df)} rows)")
+        ax.set_title(f"Stopped. Log saved: {os.path.basename(session_dir)}/{os.path.basename(current_log_path)}")
 
         # Plain-language column guide, saved alongside the CSV - the log
         # is meant to be handed to a domain expert for validation, who
         # may not know FACS AU codes or this project's internal scoring
         # terms, so the raw column headers alone aren't self-explanatory.
-        guide_path = stamped_path.replace(".csv", "_panduan_kolom.txt")
         column_guide = """PANDUAN KOLOM - tension_log
 ============================================
 
@@ -1138,23 +929,36 @@ FOTO OTOMATIS
                           skor naik masuk ke ELEVATED atau HIGH (bukan
                           difoto terus-menerus selama level itu aktif,
                           hanya di titik awal kenaikannya). File foto ada
-                          di folder snapshots/session_<ID>/ - <ID> yang
-                          sama seperti pada nama file log/report ini,
-                          jadi satu folder foto = satu sesi ini saja.
+                          di dalam folder "snapshots" pada folder sesi
+                          yang sama (session_<tanggal_jam>\\snapshots\\) -
+                          folder sesi yang sama juga berisi tension_log.csv
+                          dan report.txt ini, jadi satu folder sesi = satu
+                          sesi lengkap (CSV OpenFace, log, report, foto).
                           Buka file ini untuk melihat langsung ekspresi
                           wajah pada momen tersebut. Baris lain (tanpa
                           kenaikan level) kosong.
+
+CATATAN FILE INI
+  Panduan ini SATU file yang dipakai bersama untuk semua sesi (disimpan
+  di folder utama C:\\OpenFace\\live_output\\, bukan di dalam folder
+  sesi masing-masing), karena isinya sama untuk setiap sesi.
 
 PENTING: Semua ini adalah ringkasan pola heuristik, BUKAN kesimpulan
 kejujuran/kebohongan target. Gunakan sebagai salah satu bahan
 pertimbangan tambahan bersama observasi langsung dan konteks wawancara.
 """
-        try:
-            with open(guide_path, "w", encoding="utf-8") as f:
-                f.write(column_guide)
-            print(f"Column guide saved to {guide_path}")
-        except Exception as e:
-            print(f"Could not save column guide: {e}")
+        # Shared across every session - written once, not regenerated (and
+        # not overwritten) on each run, since its content doesn't depend
+        # on any particular session.
+        if not os.path.exists(GUIDE_PATH):
+            try:
+                with open(GUIDE_PATH, "w", encoding="utf-8") as f:
+                    f.write(column_guide)
+                print(f"Column guide saved to {GUIDE_PATH}")
+            except Exception as e:
+                print(f"Could not save column guide: {e}")
+        else:
+            print(f"Column guide already exists at {GUIDE_PATH} (shared across sessions, not rewritten)")
 
         # ---- End-of-session episode report ----
         report_lines = [
@@ -1164,15 +968,44 @@ pertimbangan tambahan bersama observasi langsung dan konteks wawancara.
             f"HIGH: {stats['HIGH']['count']}x kejadian, total {stats['HIGH']['total_duration']:.0f}s, "
             f"terlama {stats['HIGH']['longest']:.0f}s",
             "",
+        ]
+
+        # Frame-level trace: for each ELEVATED/HIGH episode, find the
+        # OpenFace frame number closest to the exact moment the episode
+        # started (same "nearest elapsed_seconds" match already used above
+        # for manual_event/tension_snapshot) - this is what actually lets
+        # someone jump to session1_aligned/frame_det_00_<frame>.* and see
+        # the aligned face crop at the instant tension rose into that level,
+        # not just a timestamp they'd have to convert themselves.
+        report_lines.append("RINCIAN FRAME SAAT TENSION NAIK KE LEVEL (untuk dicocokkan ke session1_aligned/):")
+        any_episode = False
+        for lvl in ("ELEVATED", "HIGH"):
+            for i, ep in enumerate(level_tracker.episodes[lvl], start=1):
+                any_episode = True
+                if len(log_df):
+                    nearest_idx = (log_df["elapsed_seconds"] - ep["start"]).abs().idxmin()
+                    frame_no = int(log_df.loc[nearest_idx, "frame"])
+                    frame_note = (f"frame {frame_no:06d} -> session1_aligned/frame_det_00_{frame_no:06d}.*")
+                else:
+                    frame_note = "frame tidak diketahui (log kosong)"
+                report_lines.append(
+                    f"  {lvl} #{i}: naik pada {ep['start']:.1f}s "
+                    f"(aktif sampai {ep['end']:.1f}s, durasi {ep['duration']:.1f}s) -> {frame_note}"
+                )
+        if not any_episode:
+            report_lines.append("  (tidak ada episode ELEVATED/HIGH pada sesi ini)")
+        report_lines.append("")
+
+        report_lines.append(
             "Catatan: hitungan ini menunjukkan berapa kali pola tension naik ke level tersebut "
             "secara terpisah (bukan jumlah pembacaan individual). Ini adalah ringkasan pola, "
             "BUKAN kesimpulan kejujuran/kebohongan target. Gunakan sebagai salah satu bahan "
-            "pertimbangan bersama observasi langsung dan konteks wawancara.",
-        ]
+            "pertimbangan bersama observasi langsung dan konteks wawancara."
+        )
         report_text_full = "\n".join(report_lines)
         print(report_text_full)
 
-        report_path = stamped_path.replace(".csv", "_report.txt")
+        report_path = os.path.join(session_dir, "report.txt")
         try:
             with open(report_path, "w", encoding="utf-8") as f:
                 f.write(report_text_full)
@@ -1754,10 +1587,10 @@ def update_plot(frame_num):
         return line,
 
     try:
-        if not os.path.exists(CSV_PATH):
+        if not current_csv_path or not os.path.exists(current_csv_path):
             return line,
 
-        with open(CSV_PATH, "r", newline="") as f:
+        with open(current_csv_path, "r", newline="") as f:
             if csv_header is None:
                 csv_header = f.readline()
                 csv_byte_offset = f.tell()
@@ -1839,6 +1672,11 @@ def update_plot(frame_num):
                 baseline_established = True
                 ax.set_title("Live Tension Monitor - PROTOTYPE")
                 print(f"Baseline established: {baseline_mean:.3f} (from {len(baseline_scores)} frames)")
+                # One reference photo of the "normal/neutral" state calibration
+                # was based on - same mechanism and naming convention as the
+                # ELEVATED/HIGH episode snapshots below, just triggered once
+                # here instead of on a level transition.
+                save_tension_snapshot("BASELINE", elapsed)
             continue
 
         relative_score = raw_score - baseline_mean
@@ -1964,10 +1802,16 @@ if voice_analyzer:
 
 if session_started and log_rows:
     log_df = pd.DataFrame(log_rows)
-    fallback_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    stamped_path = LOG_PATH.replace(".csv", f"_{fallback_id}.csv")
-    log_df.to_csv(stamped_path, index=False)
-    print(f"Session log saved to {stamped_path} ({len(log_df)} rows)")
+    # session_dir/current_log_path are normally already set (start_openface
+    # sets them before session_started goes True) - this fallback only
+    # matters if something unexpected left them unset.
+    if session_dir is None:
+        fallback_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_dir = os.path.join(OPENFACE_OUT_DIR, f"session_{fallback_id}")
+        os.makedirs(session_dir, exist_ok=True)
+    fallback_log_path = current_log_path or os.path.join(session_dir, "tension_log.csv")
+    log_df.to_csv(fallback_log_path, index=False)
+    print(f"Session log saved to {fallback_log_path} ({len(log_df)} rows)")
 elif not session_started:
     print("Session was already stopped and saved before the window closed.")
 else:
