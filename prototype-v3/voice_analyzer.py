@@ -17,6 +17,7 @@ room acoustics, microphone quality). Treat as one more advisory signal only.
 
 import threading
 import time
+import wave
 from collections import deque
 
 import numpy as np
@@ -60,6 +61,7 @@ class VoiceAnalyzer:
     def __init__(self, history_len=5):
         self.running = False
         self.thread = None
+        self.analysis_enabled = True  # overwritten by start()'s argument
 
         self.pitch_history = deque(maxlen=history_len)
         self.jitter_history = deque(maxlen=history_len)
@@ -72,36 +74,185 @@ class VoiceAnalyzer:
         self._buffer = np.zeros(0, dtype=np.float32)
         self._lock = threading.Lock()
 
+        # Full-session recording - separate from self._buffer above (which
+        # the analysis loop repeatedly drains/resets every CHUNK_SECONDS).
+        # Appending raw chunks to a list and concatenating once at the end
+        # (in _save_recording) is cheap per-callback and avoids repeatedly
+        # growing one big array on every audio callback for the whole
+        # session's duration.
+        self._record_path = None
+        self._record_chunks = []
+        self._first_callback_seen = False  # TEMPORARY diagnostic flag, see _audio_callback
+
     # -----------------------------------------------------------------
-    def start(self):
+    def start(self, record_path=None, analysis_enabled=True):
+        """record_path: optional - if given, every audio sample captured
+        this session is saved to this .wav path once stop() completes
+        (mono, 16-bit PCM, at SAMPLE_RATE). None (default) disables
+        recording entirely - no behavior change from before.
+
+        analysis_enabled: whether the rolling pitch/jitter/pause-ratio
+        stress scoring (_analyze_chunk, below) actually runs. Recording
+        and analysis are independent - this is what lets "Always Record
+        Audio" capture a full session even when "Enable Voice Detection"
+        (the stress-analysis toggle) is off, and vice versa. Defaults to
+        True so any existing caller that doesn't pass this keeps behaving
+        exactly as before."""
+        self._record_path = record_path
+        self._record_chunks = []
+        self.analysis_enabled = analysis_enabled
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.running = False
+        # _run()'s loop only notices self.running went False on its next
+        # wake-up (every CHUNK_SECONDS - see _run below), and the
+        # InputStream (and therefore _audio_callback) only actually closes
+        # once that loop exits its `with` block. Joining here - rather
+        # than returning immediately - guarantees the stream has fully
+        # stopped and _record_chunks can't still be appended to from the
+        # callback thread while we're about to read it below: without
+        # this, stopping right after a fresh chunk would both lose up to
+        # ~CHUNK_SECONDS of trailing audio AND risk reading
+        # _record_chunks mid-append from the other thread.
+        if self.thread is not None:
+            self.thread.join(timeout=CHUNK_SECONDS + 1.0)
+        self._save_recording()
+
+    # -----------------------------------------------------------------
+    def _save_recording(self):
+        """Writes everything accumulated in _record_chunks to
+        self._record_path as a standard mono 16-bit PCM .wav (stdlib
+        `wave` module - no extra dependency beyond what's already
+        imported). No-op if recording wasn't enabled (record_path was
+        never set) or nothing was actually captured. Never raises - a
+        failure here shouldn't take down session shutdown."""
+        if not self._record_path:
+            return
+
+        with self._lock:
+            chunks = self._record_chunks
+            self._record_chunks = []
+
+        if not chunks:
+            print("Voice recording: no audio was captured this session - nothing to save.")
+            return
+
+        try:
+            audio = np.concatenate(chunks)
+            # sounddevice gives float32 samples in roughly [-1.0, 1.0] -
+            # standard PCM .wav needs 16-bit integers, so scale and clip
+            # before converting (clip guards against the rare sample that
+            # exceeds +-1.0, which would otherwise wrap around as noise
+            # instead of just clamping like real clipping would).
+            pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+            with wave.open(self._record_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # bytes per sample = 16-bit
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(pcm16.tobytes())
+            duration_s = len(audio) / SAMPLE_RATE
+            print(f"Voice recording saved to {self._record_path} ({duration_s:.1f}s)")
+        except Exception as e:
+            print(f"Could not save voice recording: {e}")
 
     # -----------------------------------------------------------------
     def _audio_callback(self, indata, frames, time_info, status):
-        with self._lock:
-            self._buffer = np.concatenate([self._buffer, indata[:, 0]])
+        # TEMPORARY diagnostics, all safe to remove once the short-
+        # recording issue is resolved:
+        #
+        # 1. try/except around the ENTIRE body, printing a full traceback.
+        #    This did not exist before and is the most important addition
+        #    here: sounddevice/PortAudio runs this callback on its own
+        #    real-time thread via a C callback trampoline. If this
+        #    function raises ANY uncaught exception, sounddevice silently
+        #    aborts the whole input stream - no crash, no dialog, nothing
+        #    printed anywhere - and _run()'s outer loop below has no way
+        #    to notice, since it only checks self.running (which nothing
+        #    sets to False when this happens). Recording (and analysis)
+        #    would then simply stop dead, mid-session, with the rest of
+        #    the app (OpenFace, tension scoring) completely unaffected -
+        #    which matches the symptom exactly. Without this try/except,
+        #    we had NO visibility into whether this is actually happening.
+        #
+        # 2. self._last_callback_time, updated on every successful
+        #    callback - lets _run()'s loop (below) detect and print
+        #    exactly when callbacks stopped arriving, even if no
+        #    exception was involved (e.g., the stream was aborted by the
+        #    OS/driver for a reason that doesn't surface as a Python
+        #    exception at all).
+        try:
+            if not self._first_callback_seen:
+                self._first_callback_seen = True
+                print("DEBUG voice_analyzer: first audio callback received - stream is live.")
+            if status:
+                print(f"DEBUG voice_analyzer: callback status flag set: {status}")
+
+            with self._lock:
+                self._buffer = np.concatenate([self._buffer, indata[:, 0]])
+                if self._record_path is not None:
+                    self._record_chunks.append(indata[:, 0].copy())
+            self._last_callback_time = time.time()
+        except Exception:
+            import traceback
+            print("DEBUG voice_analyzer: EXCEPTION INSIDE AUDIO CALLBACK - "
+                  "this is almost certainly why recording/analysis stopped "
+                  "early. Full traceback:")
+            traceback.print_exc()
 
     # -----------------------------------------------------------------
     def _run(self):
         chunk_samples = int(CHUNK_SECONDS * SAMPLE_RATE)
 
+        # TEMPORARY diagnostics - safe to remove once resolved. If
+        # "InputStream opened" never prints, sd.InputStream(...) itself is
+        # what's hanging/failing (most likely: a device conflict with
+        # OpenFace's webcam, if they share one physical USB device, or a
+        # PortAudio/driver-level problem opening the input device at all).
+        print(f"DEBUG voice_analyzer: opening InputStream "
+              f"(device={sd.default.device}, samplerate={SAMPLE_RATE})...")
+        self._first_callback_seen = False
+        self._last_callback_time = time.time()
+        session_start = time.time()
+
         with sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
             callback=self._audio_callback
         ):
+            print("DEBUG voice_analyzer: InputStream opened successfully, entering analysis loop.")
             while self.running:
                 time.sleep(CHUNK_SECONDS)
+
+                # Heartbeat check: if nothing has arrived from the
+                # callback in way longer than one chunk interval, the
+                # stream has gone silent - print how far into the
+                # session this happened (in seconds since start()), so
+                # it can be compared directly against the on-screen
+                # elapsed time / OpenFace's own session duration.
+                silence = time.time() - self._last_callback_time
+                if silence > CHUNK_SECONDS * 2:
+                    elapsed_since_start = time.time() - session_start
+                    print(f"DEBUG voice_analyzer: no audio callback received in "
+                          f"{silence:.1f}s (now {elapsed_since_start:.1f}s into "
+                          f"this session) - the input stream has likely died "
+                          f"silently. See whether an exception was printed "
+                          f"above around the {elapsed_since_start - silence:.1f}s mark.")
 
                 with self._lock:
                     if len(self._buffer) < chunk_samples:
                         continue
                     chunk = self._buffer[-chunk_samples:].copy()
                     self._buffer = np.zeros(0, dtype=np.float32)
+
+                # Skip the actual stress-scoring (pitch/jitter/pause-ratio
+                # via parselmouth/Praat) when analysis is disabled - e.g.
+                # a session with "Always Record Audio" on but "Enable
+                # Voice Detection" off. The buffer is still drained above
+                # either way, so recording keeps working regardless.
+                if not self.analysis_enabled:
+                    continue
 
                 try:
                     self._analyze_chunk(chunk)
