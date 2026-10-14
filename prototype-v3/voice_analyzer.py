@@ -15,7 +15,7 @@ for many reasons unrelated to dishonesty (language barrier, general anxiety,
 room acoustics, microphone quality). Treat as one more advisory signal only.
 """
 
-#update ...
+#update .....
 
 import threading
 import time
