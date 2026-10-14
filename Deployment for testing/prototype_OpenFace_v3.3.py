@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.widgets import Button, RadioButtons, CheckButtons
 
-#update
+#update ...
 
 from voice_analyzer import VoiceAnalyzer  # separate file, as requested
 # Note: DeepFace is imported lazily inside find_target_in_database(), not
