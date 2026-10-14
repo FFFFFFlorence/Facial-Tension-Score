@@ -71,6 +71,15 @@ BASELINE_DURATION_SECONDS = 10
 OPENFACE_EXE = r"C:\OpenFace\OpenFace_2.2.0_win_x64\FeatureExtraction.exe"
 WEBCAM_DEVICE_INDEX = 0  # matches the "-device" index passed to OpenFace below
 
+# OpenFace's default output format for aligned face crops (the
+# session1_aligned/frame_det_00_<frame>.<ext> files). ASSUMPTION: this is
+# OpenFace 2.x's default (.bmp) - our OpenFace invocation above doesn't
+# pass any -simalign/-format flag that would change it, so this should be
+# correct, but if your install IS configured differently, update this to
+# match (otherwise the clickable links in report.txt/report.html will
+# point at a file that doesn't exist).
+ALIGNED_FRAME_EXT = "bmp"
+
 # ---------------------------------------------------------------------------
 # Output layout - one folder per session, everything that session produced
 # lives inside it:
@@ -96,6 +105,7 @@ session_dir = None             # OPENFACE_OUT_DIR/session_<id> - this session's 
 current_csv_path = None        # session_dir/session1.csv - OpenFace's own output
 current_log_path = None        # session_dir/tension_log.csv
 current_snapshot_dir = None    # session_dir/snapshots
+current_voice_path = None      # session_dir/voice_recording.wav
 
 # ---------------------------------------------------------------------------
 # Identity lookup config - separate feature from tension scoring (facial
@@ -276,6 +286,10 @@ target_record = None                # dict of the matched person's fields, or No
 session_started = False  # gates the update loop until the Start button is pressed
 voice_enabled = False    # toggled via the "Enable Voice Detection" checkbox - takes effect on next Start
                          # off by default; operator must explicitly turn it on
+voice_record_enabled = False  # toggled via the "Always Record Audio" checkbox - independent of
+                              # voice_enabled above: controls whether the session's .wav is saved,
+                              # regardless of whether stress-analysis scoring is also running.
+                              # off by default; operator must explicitly turn it on
 
 selected_timeframe_seconds = TIMEFRAME_OPTIONS[DEFAULT_TIMEFRAME_LABEL]
 last_conclusion_bucket = -1
@@ -691,7 +705,7 @@ def start_openface(event):
     global level_tracker
     global visual_baseline_mean, voice_baseline_mean
     global target_record, target_photo_image_artist
-    global session_id, session_dir, current_csv_path, current_log_path, current_snapshot_dir
+    global session_id, session_dir, current_csv_path, current_log_path, current_snapshot_dir, current_voice_path
 
     if session_started:
         return  # already running, ignore repeated clicks
@@ -701,6 +715,7 @@ def start_openface(event):
     current_csv_path = os.path.join(session_dir, "session1.csv")
     current_log_path = os.path.join(session_dir, "tension_log.csv")
     current_snapshot_dir = os.path.join(session_dir, "snapshots")
+    current_voice_path = os.path.join(session_dir, "voice_recording.wav")
     tension_snapshots.clear()
 
     target_record = None
@@ -744,16 +759,33 @@ def start_openface(event):
         fig.canvas.draw_idle()
         return
 
-    if voice_enabled:
+    # TEMPORARY diagnostics for the "stuck calibrating, OpenFace never
+    # shows" issue when voice is on - safe to remove once resolved.
+    print(f"DEBUG: OpenFace process started, PID={openface_process.pid}")
+
+    # "Enable Voice Detection" (voice_enabled) and "Always Record Audio"
+    # (voice_record_enabled) are independent toggles - either one alone
+    # is enough reason to open the mic stream. recording and analysis are
+    # then switched on/off separately inside VoiceAnalyzer itself, so a
+    # session can record without scoring, score without recording, both,
+    # or neither.
+    if voice_enabled or voice_record_enabled:
         voice_analyzer = VoiceAnalyzer()
         try:
-            voice_analyzer.start()
+            print(f"DEBUG: calling voice_analyzer.start() "
+                  f"(analysis_enabled={voice_enabled}, "
+                  f"recording={'on' if voice_record_enabled else 'off'})...")
+            voice_analyzer.start(
+                record_path=current_voice_path if voice_record_enabled else None,
+                analysis_enabled=voice_enabled,
+            )
+            print("DEBUG: voice_analyzer.start() returned - main thread continuing normally.")
         except Exception as e:
             print(f"Voice analyzer failed to start (continuing with visual-only scoring): {e}")
             voice_analyzer = None
     else:
         voice_analyzer = None
-        print("Voice detection is OFF for this session (facial score only).")
+        print("Voice detection and recording are both OFF for this session (facial score only).")
 
     # full reset so Start -> Stop -> Start again behaves as a clean new session
     start_time = None
@@ -815,7 +847,29 @@ def stop_openface(event):
         openface_process.terminate()
         openface_process = None
     if voice_analyzer:
-        voice_analyzer.stop()
+        # voice_analyzer.stop() blocks for up to ~CHUNK_SECONDS+1s (a few
+        # seconds) to join its audio thread cleanly before writing the
+        # .wav - see voice_analyzer.py. Running it in a background thread
+        # here instead of calling it directly keeps stop_openface() (a
+        # GUI button callback) from freezing the window for that whole
+        # duration - the Stop button now returns immediately, and the
+        # recording finishes saving a moment later in the background.
+        # Daemon thread, no join: nothing past this point in
+        # stop_openface() depends on the .wav already being on disk, so
+        # there's nothing to wait for here.
+        #
+        # One edge case this trades in: if Stop is clicked and then Start
+        # is clicked again within that same ~3s window, the OLD
+        # VoiceAnalyzer's stream is still mid-shutdown while the NEW
+        # session's VoiceAnalyzer opens its own stream - two input
+        # streams briefly overlapping. Unlike the webcam's exclusive
+        # access, Windows audio input generally supports multiple
+        # concurrent opens of the same device (WASAPI shared mode), so
+        # this is low-risk, but it's not a hard guarantee on every
+        # driver - worth knowing if voice features ever glitch
+        # specifically on a rapid Stop-then-Start.
+        voice_to_stop = voice_analyzer
+        threading.Thread(target=voice_to_stop.stop, daemon=True).start()
         voice_analyzer = None
 
     # finalize any still-active ELEVATED/HIGH episode so it's included in the report
@@ -1120,15 +1174,19 @@ def toggle_voice(label):
 
 
 # voice_toggle_ax = plt.axes([0.686, 0.39, 0.36, 0.06])
-voice_toggle_ax = plt.axes([0.547, 0.18, 0.36, 0.06])
+# Width halved (0.36 -> 0.175) so the new "Always Record Audio" checkbox
+# (below) can sit beside it in the same row, rather than stacking - the
+# row directly below this one is the full-width legend panel, so there's
+# no vertical room to add a second row here.
+voice_toggle_ax = plt.axes([0.547, 0.194, 0.36, 0.06])
 voice_toggle_ax.set_zorder(10)
 voice_toggle_ax.set_frame_on(False)
 
 # Instantiate CheckButtons with enlarged frame and checkmark sizes
 # Increase 'sizes' (area in pts^2) to make the square box larger (default is ~100)
 voice_toggle = CheckButtons(
-    voice_toggle_ax, 
-    ["Enable Voice Detection"], 
+    voice_toggle_ax,
+    ["Enable Voice Detection"],
     [False],
     frame_props={'sizes': [75], 'linewidth': 1},
     check_props={'sizes': [30], 'linewidth': 1}
@@ -1136,10 +1194,48 @@ voice_toggle = CheckButtons(
 
 # Adjust label text position and font size so it doesn't overlap the box
 voice_toggle.labels[0].set_x(0.18)
-voice_toggle.labels[0].set_fontsize(8)
+voice_toggle.labels[0].set_fontsize(7)
 
 # Attach callback function
 voice_toggle.on_clicked(toggle_voice)
+
+
+# ---------------------------------------------------------------------------
+# "Always Record Audio" toggle - a separate, explicitly-labeled control for
+# saving the session's .wav. Deliberately kept independent from
+# "Enable Voice Detection" above: that checkbox only controls whether the
+# pitch/jitter/pause-ratio stress SCORING runs, so an operator unchecking
+# it should not be surprised to find audio was captured anyway. Whether a
+# .wav gets saved at all is this checkbox, and only this checkbox - visible
+# and explicit, not a side effect of the other one.
+# Only takes effect the NEXT time "Start OpenFace" is clicked, same as the
+# voice-detection toggle above.
+# ---------------------------------------------------------------------------
+def toggle_voice_recording(label):
+    global voice_record_enabled
+    voice_record_enabled = not voice_record_enabled
+    print(f"Always Record Audio {'enabled' if voice_record_enabled else 'disabled'} - takes effect on next Start.")
+
+
+# Same row as voice_toggle_ax, placed immediately to its right (0.547 +
+# 0.175 = 0.722 start), so both checkboxes occupy the same overall
+# footprint the single wider checkbox used to.
+voice_record_toggle_ax = plt.axes([0.561, 0.170, 0.36, 0.06])
+voice_record_toggle_ax.set_zorder(10)
+voice_record_toggle_ax.set_frame_on(False)
+
+voice_record_toggle = CheckButtons(
+    voice_record_toggle_ax,
+    ["Record Audio"],
+    [False],
+    frame_props={'sizes': [75], 'linewidth': 1},
+    check_props={'sizes': [30], 'linewidth': 1}
+)
+
+voice_record_toggle.labels[0].set_x(0.18)
+voice_record_toggle.labels[0].set_fontsize(7)
+
+voice_record_toggle.on_clicked(toggle_voice_recording)
 
 
 # ---------------------------------------------------------------------------
@@ -1264,7 +1360,14 @@ def update_voice_panel():
     features directly (independent of the video frame rate, since audio
     chunks are computed on their own ~2s cadence)."""
     if not voice_enabled:
-        voice_text.set_text("Voice detection:\nOFF\n(unchecked)")
+        # Stress-analysis scoring is off, but recording may still be
+        # running independently (see "Always Record Audio") - say so,
+        # rather than a flat "OFF" that would wrongly suggest nothing
+        # is being captured at all this session.
+        if voice_record_enabled:
+            voice_text.set_text("Voice detection:\nOFF (unchecked)\n\nAudio IS being\nrecorded this\nsession.")
+        else:
+            voice_text.set_text("Voice detection:\nOFF\n(unchecked)")
         return
     if voice_analyzer is None:
         voice_text.set_text("Voice channel:\nnot running")
@@ -1644,13 +1747,25 @@ def update_plot(frame_num):
         gaze_score = compute_gaze_variance_score()
         visual_score = au_score + (gaze_score * GAZE_VARIANCE_WEIGHT)
 
-        if voice_analyzer:
+        # Gate on voice_enabled, NOT just "voice_analyzer exists": since
+        # "Always Record Audio" was added, voice_analyzer can now be a
+        # real object (recording-only, analysis_enabled=False inside it)
+        # even while voice detection/analysis is OFF. Checking only
+        # `if voice_analyzer:` here would then apply
+        # VISUAL_CHANNEL_WEIGHT/VOICE_CHANNEL_WEIGHT (0.75/0.25) instead
+        # of giving the facial channel full weight - voice_score would
+        # still read 0.0 (its scoring loop never runs), so raw_score
+        # would be silently cut to 75% of visual_score, exactly the
+        # "face line and combined line no longer match when voice is
+        # off" gap this fixes.
+        if voice_enabled and voice_analyzer:
             voice_score = voice_analyzer.get_score()
             active_visual_weight, active_voice_weight = VISUAL_CHANNEL_WEIGHT, VOICE_CHANNEL_WEIGHT
         else:
-            # voice disabled (or failed to start) - give the facial channel
-            # the full weight instead of silently losing VOICE_CHANNEL_WEIGHT's
-            # share of the score (which would otherwise shrink every reading)
+            # voice detection disabled (or failed to start) - give the
+            # facial channel the full weight instead of silently losing
+            # VOICE_CHANNEL_WEIGHT's share of the score (which would
+            # otherwise shrink every reading)
             voice_score = 0.0
             active_visual_weight, active_voice_weight = 1.0, 0.0
 
@@ -1748,8 +1863,12 @@ def update_plot(frame_num):
 
         # Individual acoustic features behind voice_score, when voice
         # scoring is active - same transparency principle as the AUs:
-        # a combined voice_score alone can't be validated on its own
-        if voice_analyzer:
+        # a combined voice_score alone can't be validated on its own.
+        # Gated on voice_enabled (not just voice_analyzer existing) for
+        # the same reason as the weighting above - a recording-only
+        # session (analysis off) never runs _analyze_chunk, so these
+        # would otherwise log as empty/stale NaN columns every row.
+        if voice_enabled and voice_analyzer:
             voice_features = voice_analyzer.get_features()
             log_row["voice_pitch_mean_hz"] = _safe_round(voice_features.get("pitch_mean", np.nan), 1)
             log_row["voice_pitch_variability"] = _safe_round(voice_features.get("pitch_variability", np.nan))
@@ -1798,6 +1917,12 @@ plt.show()
 if openface_process:
     openface_process.terminate()
 if voice_analyzer:
+    # Deliberately NOT backgrounded like the Stop-button path above: the
+    # script is about to exit right after this block, with no event loop
+    # left running to keep a daemon thread alive - backgrounding this
+    # call would risk the process exiting before the .wav finishes
+    # writing. There's also no GUI left to freeze at this point (plt.show()
+    # has already returned), so blocking here costs nothing visible.
     voice_analyzer.stop()
 
 if session_started and log_rows:
