@@ -1220,7 +1220,7 @@ def toggle_voice_recording(label):
 # Same row as voice_toggle_ax, placed immediately to its right (0.547 +
 # 0.175 = 0.722 start), so both checkboxes occupy the same overall
 # footprint the single wider checkbox used to.
-voice_record_toggle_ax = plt.axes([0.561, 0.172, 0.36, 0.06])
+voice_record_toggle_ax = plt.axes([0.561, 0.170, 0.36, 0.06])
 voice_record_toggle_ax.set_zorder(10)
 voice_record_toggle_ax.set_frame_on(False)
 
