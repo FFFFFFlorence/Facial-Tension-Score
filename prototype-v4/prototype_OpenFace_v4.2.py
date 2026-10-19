@@ -1,6 +1,10 @@
 import subprocess
 import textwrap
 import os
+import csv
+import shutil
+import glob
+import re
 import cv2
 import threading
 import pandas as pd
@@ -80,6 +84,47 @@ WEBCAM_DEVICE_INDEX = 0  # matches the "-device" index passed to OpenFace below
 # match (otherwise the clickable links in report.txt/report.html will
 # point at a file that doesn't exist).
 ALIGNED_FRAME_EXT = "bmp"
+
+# ---------------------------------------------------------------------------
+# v4.3 switches - set True / False
+# ---------------------------------------------------------------------------
+# Snapshot source #1 (NEW): copy the face image OpenFace already wrote for the
+# exact frame where tension rose (session_<id>/session1_aligned/frame_det_00_<frame>.<ext>)
+# into the snapshots/ folder. Does not touch the webcam, never blocks, cannot fail
+# because the camera is busy. NOTE: it is OpenFace's aligned FACE CROP (small, 112x112 by
+# default, pose-normalised), not the full camera picture - see OPENFACE_EXTRA_ARGS below
+# to make it larger.
+SNAPSHOT_FROM_ALIGNED = True
+# Snapshot source #2 (the OLD way): open the webcam briefly and grab a full frame.
+# Now runs on its own thread so it no longer freezes the window. Needs the webcam to
+# be free while OpenFace is running, which often is NOT the case - hence off by default.
+SNAPSHOT_FROM_WEBCAM = False
+# Both True = two images per rise (one of each kind).
+
+ALIGNED_WAIT_SECONDS = 5.0    # how long to wait for OpenFace to finish writing the aligned image
+ALIGNED_NEAREST_FRAMES = 10   # if that exact frame wasn't written, use the nearest one within this many frames
+
+# Extra command-line arguments appended to the FeatureExtraction call, e.g. a larger
+# aligned face: ["-simsize", "224"]. Check the flag names with FeatureExtraction.exe -h.
+OPENFACE_EXTRA_ARGS = []
+
+# Use OpenFace's own per-frame "timestamp" column as the time axis instead of the moment
+# the script happened to read the row (rows are read in ~0.5 s batches, so the old way gave
+# every row in a batch the same time). Set False to go back to the old behaviour.
+USE_VIDEO_TIMESTAMPS = True
+
+# Seconds without any reliable face frame before the big status shows "WAJAH HILANG".
+FACE_LOST_SECONDS = 2.0
+
+# Save the tension log every N seconds to session_<id>/tension_log.partial.csv (LOCAL file
+# only - nothing is sent anywhere), so a crash / power loss doesn't lose the whole session.
+# Removed automatically after the normal end-of-session save. 0 = off.
+AUTOSAVE_LOG_SECONDS = 30
+
+# Count one continuous ELEVATED/HIGH stretch as ONE episode (listed under the highest level it
+# reached) instead of a new episode every time the score crosses the ELEVATED/HIGH line.
+# Changes the E:/H: counts and the report, so it is OFF by default.
+MERGE_ELEVATED_HIGH_EPISODES = False
 
 # ---------------------------------------------------------------------------
 # Output layout - one folder per session, everything that session produced
@@ -173,6 +218,14 @@ class LevelEpisodeTracker:
     def update(self, t, value):
         level = self.classify(value)
 
+        if MERGE_ELEVATED_HIGH_EPISODES and level is not None and self.active_level is not None:
+            # still inside one continuous ELEVATED/HIGH stretch: just extend it; remember the highest level
+            self.episode_last_seen = t
+            self.pending_exit_since = None
+            if level == "HIGH":
+                self.active_level = "HIGH"
+            return
+
         if level == self.active_level:
             if level is not None:
                 self.episode_last_seen = t
@@ -265,6 +318,14 @@ baseline_scores = []
 baseline_mean = None
 baseline_established = False
 start_time = None
+rows_seen = 0                # OpenFace rows read this session (for the report's data-quality line)
+rows_unreliable = 0          # ...of which skipped (low confidence / face not detected)
+first_video_ts = None        # OpenFace timestamp of the first reliable row (time axis starts there)
+last_reliable_wall = None    # wall-clock time of the last reliable face frame
+face_lost = False
+_openface_exit_reported = False
+_transcript_thread = None    # background transcript finalize thread (waited for on exit)
+_autosave = {"last": 0.0, "written": 0}
 
 last_row_count = 0
 csv_header = None       # cached header line, set once per session
@@ -276,10 +337,8 @@ voice_analyzer = None
 session_started = False  # gates the update loop until the Start button is pressed
 voice_enabled = False    # toggled via the "Enable Voice Detection" checkbox - takes effect on next Start
                          # off by default; operator must explicitly turn it on
-voice_record_enabled = False  # toggled via the "Always Record Audio" checkbox - independent of
-                              # voice_enabled above: controls whether the session's .wav is saved,
-                              # regardless of whether stress-analysis scoring is also running.
-                              # off by default; operator must explicitly turn it on
+# (No "Record Audio" checkbox any more: the microphone is ALWAYS recorded to
+# session_<id>/voice_recording.wav, because the transcript is made from that file.)
 
 transcriber = None           # the active Transcriber instance for this session, or None
 voice_session_start = None   # wall-clock time the mic stream was started (to align transcript times)
@@ -462,14 +521,14 @@ transcript_title = transcript_panel_ax.text(
 # panel's real width instead, and the artist is hard-clipped to the panel
 # box as a backstop so nothing can ever draw outside it.
 transcript_text = transcript_panel_ax.text(
-    0.04, 0.84, "Transkripsi aktif.\nTekan Start untuk memulai sesi; konteks\npercakapan muncul di sini setelah Stop.", fontsize=8,
+    0.04, 0.84, "Menunjukan konteks percakapan saat tingkat tension meningkat.", fontsize=8,
     ha="left", va="top", color="dimgray",
     transform=transcript_panel_ax.transAxes,
     clip_on=True,
 )
 transcript_text.set_clip_box(transcript_panel_ax.bbox)
 
-TRANSCRIPT_GAP_PT = 14          # gap (points) from box top to title, and the SAME gap from title to the contents
+TRANSCRIPT_GAP_PT = 20          # gap (points) from box top to title, and the SAME gap from title to the contents
 
 
 def _layout_transcript_vertical():
@@ -564,10 +623,7 @@ def update_transcript_panel():
         transcript_text.set_text("Transkripsi: mikrofon tidak aktif\n(gagal dibuka atau belum siap).")
         return
     transcript_text.set_text(
-        "Transkripsi aktif.\n"
-        "Rekaman suara diproses setelah Stop, lalu\n"
-        "konteks percakapan di setiap lonjakan\n"
-        "tension ditampilkan di sini."
+        "Rekaman suara akan diproses setelah session selesai."
     )
 
 
@@ -579,8 +635,34 @@ def update_transcript_panel():
 _pending_transcript_result = [None]
 
 
+REPORT_TRANSCRIPT_PLACEHOLDER = "   (Transkrip belum tersedia - sedang diproses. Bagian ini terisi otomatis begitu selesai.)"
+
+
+def _insert_into_report(report_path, body, report_ready=None):
+    """Runs on the transcript thread (no GUI involved), so the report is completed even if
+    the window has been closed in the meantime. Replaces the placeholder in section 4 of
+    report.txt (the report keeps its closing notes at the very end)."""
+    if not report_path:
+        return
+    if report_ready is not None:
+        report_ready.wait(timeout=60)   # report.txt is created by stop_openface
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        if REPORT_TRANSCRIPT_PLACEHOLDER in text:
+            text = text.replace(REPORT_TRANSCRIPT_PLACEHOLDER, body)
+        else:
+            text += "\n" + body + "\n"
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"Transcript context added to {report_path}")
+    except Exception as e:
+        print(f"Could not add transcript context to report: {e}")
+
+
 def _finalize_transcript_and_context(transcriber_obj, episodes, report_path,
-                                     voice_stop_thread=None, wav_path=None, time_offset=0.0):
+                                     voice_stop_thread=None, wav_path=None, time_offset=0.0,
+                                     report_ready=None, ep_lookup=None):
     """Runs on a background thread (spawned from stop_openface) - NOT on
     the GUI thread, since transcriber_obj.stop() blocks for a few seconds
     while Whisper finishes anything still queued. Builds the heuristic
@@ -596,47 +678,62 @@ def _finalize_transcript_and_context(transcriber_obj, episodes, report_path,
 
     if transcriber_obj._load_error and not transcriber_obj.get_segments():
         err = transcriber_obj._load_error
-        _pending_transcript_result[0] = (
-            [f"Transkripsi gagal:\n{err}"],
-            f"\nKONTEKS PERCAKAPAN: transkripsi gagal ({err})", report_path)
+        _insert_into_report(report_path, f"   Transkripsi gagal: {err}", report_ready)
+        _pending_transcript_result[0] = ([f"Transkripsi gagal:\n{err}"], "", None)
         return
 
-    all_entries = []  # (full text for report.txt, shortened text for the on-screen panel)
+    ep_lookup = ep_lookup or {}
+    all_entries = []  # (block for report.txt, text for the on-screen panel)
     any_ctx = False
-    for g in group_episode_contexts(transcriber_obj, episodes):
+    for k, g in enumerate(group_episode_contexts(transcriber_obj, episodes), start=1):
         ctx = g["ctx"]
         title = " + ".join(g["levels"])
         if len(g["levels"]) == 1:
             when = ", ".join(f"{t:.0f}s" for t in g["times"][g["levels"][0]])
         else:
             when = "; ".join(f"{l}: " + ", ".join(f"{t:.0f}s" for t in g["times"][l]) for l in g["levels"])
+
+        # which numbered spikes (section 2 of the report) belong to this context
+        spikes = sorted(
+            (t, lvl, ep_lookup.get((lvl, t))) for lvl in g["levels"] for t in g["times"][lvl])
+        spike_txt = ", ".join(
+            (f"#{n} " if n else "") + f"{lvl} {_mmss(t)}" for t, lvl, n in spikes)
+
         if ctx is None:
-            full = f"{title} (naik pada {when}): (tidak ada ucapan terekam di sekitar momen ini)"
-            panel = full
+            panel = f"{title} (naik pada {when}): (tidak ada ucapan terekam di sekitar momen ini)"
+            block = (f"   Konteks {k}  -  tidak ada ucapan terekam di sekitar momen ini\n"
+                     f"   Lonjakan  : {spike_txt}")
         else:
             q_tag = " [berisi pertanyaan]" if ctx["has_question"] else ""
             span = f"[{ctx['context_start']:.0f}s-{ctx['context_end']:.0f}s]"
             quote = ctx["text"]
-            full = f"{title} {span}{q_tag} (naik pada {when}):\n  \"{quote}\""
             panel = f"{title} {span}{q_tag}\n(naik pada {when}):\n\"{quote}\""   # full quote, never truncated
+            head = f"   Konteks {k}  -  {_mmss(ctx['context_start'])} s/d {_mmss(ctx['context_end'])}"
+            if ctx["has_question"]:
+                head += "  -  berisi pertanyaan"
+            quote_block = textwrap.fill(f'"{quote}"', width=REPORT_WIDTH,
+                                        initial_indent="      ", subsequent_indent="      ")
+            block = f"{head}\n   Lonjakan  : {spike_txt}\n   Ucapan    :\n{quote_block}"
             any_ctx = True
-        all_entries.append((full, panel))
+        all_entries.append((block, panel))
 
-    report_section_lines = [
-        "", "KONTEKS PERCAKAPAN SAAT TENSION NAIK (heuristik, dari jeda bicara - BUKAN AI/LLM):",
-    ]
-    for full, _panel in all_entries:
-        report_section_lines.append("  " + full.replace("\n  ", "\n    "))
+    body_lines = []
+    for block, _panel in all_entries:
+        body_lines.append(block)
+        body_lines.append("")
     if not all_entries:
-        report_section_lines.append("  (tidak ada episode ELEVATED/HIGH pada sesi ini)")
+        body_lines = [_wrap("(Tidak ada lonjakan ELEVATED/HIGH pada sesi ini, jadi tidak ada konteks yang ditampilkan.)", 3)]
     elif not any_ctx:
-        report_section_lines.append("  (tidak ada ucapan yang berhasil dicocokkan ke episode manapun)")
+        body_lines.append("   (tidak ada ucapan yang berhasil dicocokkan ke lonjakan manapun)")
+    while body_lines and body_lines[-1] == "":
+        body_lines.pop()
 
     if not all_entries:
         panel_entries = ["(Tidak ada episode ELEVATED/HIGH pada sesi ini.)"]
     else:
-        panel_entries = [p for _f, p in all_entries]
-    _pending_transcript_result[0] = (panel_entries, "\n".join(report_section_lines), report_path)
+        panel_entries = [p for _b, p in all_entries]
+    _insert_into_report(report_path, "\n".join(body_lines), report_ready)
+    _pending_transcript_result[0] = (panel_entries, "", None)   # GUI only displays; the file is already written
 
 
 def _check_transcript_finalize_result():
@@ -716,23 +813,473 @@ session_id = None       # set once per session in start_openface, e.g. "20260908
 tension_snapshots = []  # (elapsed_seconds, level, saved_path) - persisted into the log at Stop
 
 
-def save_tension_snapshot(level, elapsed):
-    frame = _grab_clean_webcam_frame(WEBCAM_DEVICE_INDEX)
+_webcam_grab_lock = threading.Lock()
+
+
+def _save_webcam_snapshot(level, elapsed, snap_dir):
+    """OLD method (SNAPSHOT_FROM_WEBCAM): brief separate webcam open-grab-release.
+    Runs on its own thread so a slow/failed grab can't freeze the window."""
+    with _webcam_grab_lock:
+        frame = _grab_clean_webcam_frame(WEBCAM_DEVICE_INDEX)
     if frame is None:
-        print(f"Could not capture snapshot for {level} episode at {elapsed:.0f}s "
+        print(f"Could not capture webcam snapshot for {level} episode at {elapsed:.0f}s "
               f"(webcam likely unavailable while OpenFace holds it)")
         return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    os.makedirs(current_snapshot_dir, exist_ok=True)
+    os.makedirs(snap_dir, exist_ok=True)
     filename = f"{level}_{elapsed:.0f}s_{timestamp}.jpg"
-    path = os.path.join(current_snapshot_dir, filename)
+    path = os.path.join(snap_dir, filename)
     try:
         cv2.imwrite(path, frame)
         tension_snapshots.append((elapsed, level, path))
-        print(f"Snapshot saved for {level} episode at {elapsed:.0f}s at {timestamp}: {path}")
+        print(f"Webcam snapshot saved for {level} episode at {elapsed:.0f}s: {path}")
     except Exception as e:
         print(f"Could not save snapshot: {e}")
+
+
+def _save_aligned_snapshot(level, elapsed, frame_no, aligned_dir, snap_dir):
+    """NEW method (SNAPSHOT_FROM_ALIGNED): copy OpenFace's own aligned face image for
+    the frame where tension rose. OpenFace writes images a moment after the CSV row,
+    so wait (on this thread) until the file exists and has stopped growing."""
+    if frame_no is None or frame_no < 0:
+        print(f"Aligned snapshot skipped for {level} at {elapsed:.0f}s: unknown frame number")
+        return
+    src = os.path.join(aligned_dir, f"frame_det_00_{frame_no:06d}.{ALIGNED_FRAME_EXT}")
+    deadline = time.time() + ALIGNED_WAIT_SECONDS
+    ready = False
+    while time.time() < deadline:
+        if os.path.exists(src):
+            size1 = os.path.getsize(src)
+            time.sleep(0.15)
+            if size1 > 0 and os.path.getsize(src) == size1:
+                ready = True
+                break
+        time.sleep(0.1)
+
+    used_frame = frame_no
+    if not ready:
+        # that exact frame wasn't written (OpenFace can skip badly aligned frames) - use the nearest one
+        best = None
+        for f in glob.glob(os.path.join(aligned_dir, f"frame_det_00_*.{ALIGNED_FRAME_EXT}")):
+            m = re.search(r"frame_det_00_(\d+)\.", os.path.basename(f))
+            if m:
+                d = abs(int(m.group(1)) - frame_no)
+                if d <= ALIGNED_NEAREST_FRAMES and (best is None or d < best[0]):
+                    best = (d, int(m.group(1)), f)
+        if best is None:
+            print(f"Aligned snapshot not found for {level} at {elapsed:.0f}s (frame {frame_no}) in {aligned_dir} "
+                  f"- is OpenFace writing aligned faces?")
+            return
+        _d, used_frame, src = best
+        print(f"Aligned frame {frame_no} missing - using nearest frame {used_frame}")
+
+    try:
+        os.makedirs(snap_dir, exist_ok=True)
+        dst = os.path.join(snap_dir, f"{level}_{elapsed:.0f}s_frame{used_frame:06d}_aligned.{ALIGNED_FRAME_EXT}")
+        shutil.copy2(src, dst)
+        tension_snapshots.append((elapsed, level, dst))
+        print(f"Aligned snapshot saved for {level} episode at {elapsed:.0f}s (frame {used_frame}): {dst}")
+    except Exception as e:
+        print(f"Could not save aligned snapshot: {e}")
+
+
+_snapshot_threads = []
+
+
+def save_tension_snapshot(level, elapsed, frame_no=None):
+    """Called the instant tension rises into a level (and once for BASELINE).
+    Never blocks the window: each enabled method runs on its own thread."""
+    _snapshot_threads[:] = [t for t in _snapshot_threads if t.is_alive()]
+    if SNAPSHOT_FROM_ALIGNED and session_dir:
+        t = threading.Thread(
+            target=_save_aligned_snapshot,
+            args=(level, elapsed, frame_no, os.path.join(session_dir, "session1_aligned"), current_snapshot_dir),
+            daemon=True,
+        )
+        t.start()
+        _snapshot_threads.append(t)
+    if SNAPSHOT_FROM_WEBCAM and current_snapshot_dir:
+        t = threading.Thread(
+            target=_save_webcam_snapshot, args=(level, elapsed, current_snapshot_dir), daemon=True,
+        )
+        t.start()
+        _snapshot_threads.append(t)
+
+
+# ---------------------------------------------------------------------------
+# report.txt and panduan_kolom.txt builders
+# ---------------------------------------------------------------------------
+REPORT_WIDTH = 76
+_BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+          "Agustus", "September", "Oktober", "November", "Desember"]
+
+
+def _mmss(t):
+    t = max(0, int(round(t)))
+    return f"{t // 60:02d}:{t % 60:02d}"
+
+
+def _dur(t):
+    if t >= 60:
+        return f"{int(t // 60)}m {int(round(t % 60))}s"
+    return f"{t:.1f}s"
+
+
+def _tanggal(dt):
+    return f"{dt.day} {_BULAN[dt.month - 1]} {dt.year}"
+
+
+def number_episodes(episodes):
+    """Numbers every ELEVATED/HIGH episode chronologically (#1, #2, ...) so the
+    report's tables, details and transcript contexts can refer to each other.
+    Returns ([(n, level, episode), ...], {(level, start): n})."""
+    items = []
+    for lvl in ("ELEVATED", "HIGH"):
+        for ep in episodes.get(lvl, []):
+            items.append((ep["start"], lvl, ep))
+    items.sort(key=lambda x: x[0])
+    numbered = [(i, lvl, ep) for i, (_t, lvl, ep) in enumerate(items, start=1)]
+    return numbered, {(lvl, ep["start"]): n for n, lvl, ep in numbered}
+
+
+def _wrap(text, indent=0, width=REPORT_WIDTH):
+    return textwrap.fill(text, width=width, initial_indent=" " * indent, subsequent_indent=" " * indent)
+
+
+def _kv(label, value, label_w=18):
+    pad = " " * (1 + label_w + 3)
+    return textwrap.fill(value, width=REPORT_WIDTH, initial_indent=f" {label:<{label_w}} : ",
+                         subsequent_indent=pad)
+
+
+def _episode_details(log_df, lvl, ep):
+    """Per-episode facts from the log: peak/mean score, what moved, which channel drove it."""
+    seg = log_df[(log_df["elapsed_seconds"] >= ep["start"] - 1e-6) & (log_df["elapsed_seconds"] <= ep["end"] + 1e-6)]
+    d = {"peak": None, "mean": None, "signals": "", "driver": ""}
+    if seg.empty:
+        return d
+    d["peak"] = float(seg["smoothed_score"].max())
+    d["mean"] = float(seg["smoothed_score"].mean())
+    dom = seg["dominant_signal"].astype(str)
+    dom = dom[(dom != "") & (dom != "nan") & (dom != "Tidak ada AU menonjol")]
+    if len(dom):
+        top = dom.value_counts().head(2)
+        d["signals"] = "; ".join(f"{name} ({cnt / len(dom):.0%})" for name, cnt in top.items())
+    if "voice_score" in seg and seg["voice_score"].abs().sum() > 0:
+        face = VISUAL_CHANNEL_WEIGHT * float(seg["visual_smoothed"].mean())
+        voice = VOICE_CHANNEL_WEIGHT * float(seg["voice_smoothed"].mean())
+        pos_face, pos_voice = max(face, 0.0), max(voice, 0.0)
+        tot = pos_face + pos_voice
+        if tot > 0:
+            d["driver"] = f"wajah {pos_face / tot:.0%} / suara {pos_voice / tot:.0%}"
+    else:
+        d["driver"] = "wajah (analisis suara tidak aktif)"
+    return d
+
+
+def compute_session_summary(log_df):
+    """Numbers behind the session summary - used by BOTH report.txt (section 1) and the
+    on-screen Summary panel, so the two can never disagree."""
+    secs = {"BELOW": 0.0, "BASELINE": 0.0, "ELEVATED": 0.0, "HIGH": 0.0}
+    monitored = 0.0
+    if len(log_df) > 1:
+        dt = log_df["elapsed_seconds"].diff().shift(-1).fillna(0).clip(lower=0, upper=1.0)
+        for lvl_name, grp in dt.groupby(log_df["level"]):
+            secs[lvl_name] = float(grp.sum())
+        monitored = float(dt.sum())
+    peak_row = log_df.loc[log_df["smoothed_score"].idxmax()] if len(log_df) else None
+    return {
+        "secs": secs,
+        "monitored": monitored,
+        "peak": None if peak_row is None else (float(peak_row["smoothed_score"]),
+                                               float(peak_row["elapsed_seconds"]), str(peak_row["level"])),
+        "mean": float(log_df["smoothed_score"].mean()) if len(log_df) else None,
+    }
+
+
+def summary_table_lines(stats, summ, compact=False):
+    """The summary block as (text, kind) lines, kind in header/ELEVATED/HIGH/text.
+    Fixed-width layout - monospace in report.txt and in the Summary panel.
+    compact=True (Summary panel): the long 'Waktu per level' line is split in two and the
+    wording is shortened, so the widest line is shorter and the panel can use a bigger font."""
+    monitored = summ["monitored"]
+    out = [(f"{'Level':<10}{'Kejadian':>9}{'Total waktu':>14}{'% pemantauan':>14}{'Terlama':>10}", "header")]
+    for lvl in ("ELEVATED", "HIGH"):
+        st = stats[lvl]
+        share = (st["total_duration"] / monitored * 100) if monitored else 0.0
+        out.append((f"{lvl:<10}{str(st['count']) + 'x':>9}{_dur(st['total_duration']):>14}"
+                    f"{share:>13.1f}%{_dur(st['longest']):>10}", lvl))
+    if not compact:
+        out.append(("", "text"))
+    if monitored:
+        values = "  ".join(f"{name} {summ['secs'][name] / monitored * 100:.0f}%"
+                           for name in ("BELOW", "BASELINE", "ELEVATED", "HIGH"))
+        if compact:
+            out.append(("Waktu per level:", "text"))
+            out.append(("  " + values, "text"))
+        else:
+            out.append((f"{'Waktu per level':<18} : " + values, "text"))
+    if summ["peak"] is not None:
+        pv, pt, pl = summ["peak"]
+        if compact:
+            out.append((f"Skor tertinggi : {pv:+.2f} pada {_mmss(pt)} ({pl})", "text"))
+            out.append((f"Skor rata-rata : {summ['mean']:+.2f} (0 = baseline)", "text"))
+        else:
+            out.append((f"{'Skor tertinggi':<18} : {pv:+.2f} pada {_mmss(pt)}  ({pl})", "text"))
+            out.append((f"{'Skor rata-rata':<18} : {summ['mean']:+.2f}  (0 = sama dengan kondisi awal)", "text"))
+    return out
+
+
+def build_report_text(log_df, stats, end_t, ended_at, transcript_pending):
+    W = REPORT_WIDTH
+    bar, thin = "=" * W, "-" * W
+    started_at = datetime.strptime(session_id, "%Y%m%d_%H%M%S") if session_id else ended_at
+    numbered, _lookup = number_episodes(level_tracker.episodes)
+
+    summ = compute_session_summary(log_df)
+    t_first = float(log_df["elapsed_seconds"].iloc[0]) if len(log_df) else 0.0
+
+    L = [bar, " LAPORAN SESI - LIVE TENSION MONITOR", bar]
+    L.append(_kv("Sesi", f"{os.path.basename(session_dir)}"))
+    L.append(_kv("Tanggal", f"{_tanggal(started_at)}, {started_at:%H:%M:%S} - {ended_at:%H:%M:%S}"))
+    L.append(_kv("Durasi", f"{_mmss(end_t)} total  (kalibrasi baseline {BASELINE_DURATION_SECONDS}s, "
+                           f"pemantauan {_mmss(max(0.0, end_t - t_first))})"))
+    L.append(_kv("Baseline", f"{baseline_mean:+.3f}  (rata-rata skor mentah selama kalibrasi = kondisi awal target)"
+                 if baseline_mean is not None else "belum terbentuk"))
+    valid = rows_seen - rows_unreliable
+    pct = (valid / rows_seen * 100) if rows_seen else 0.0
+    L.append(_kv("Kualitas data", f"{rows_seen} frame dibaca, {valid} valid ({pct:.1f}%), "
+                                  f"{rows_unreliable} dilewati (wajah tidak terdeteksi / keyakinan < {MIN_TRACKING_CONFIDENCE})"))
+    L.append(_kv("Sinyal dipakai", "wajah (AU + gaze)" + (" + suara" if voice_enabled else "  (analisis suara OFF)")))
+    L.append(_kv("Rekaman suara", "voice_recording.wav (di folder sesi)"))
+    L.append(_kv("Ambang level", f"ELEVATED >= {ELEVATED_THRESHOLD:.1f}, HIGH >= {HIGH_THRESHOLD:.1f}  (selisih dari baseline)"))
+    if len(log_df) and pct < 80:
+        L.append("")
+        L.append(_wrap("PERHATIAN: kurang dari 80% frame valid - pencahayaan, sudut wajah atau posisi kamera "
+                       "kemungkinan mengganggu; baca hasil dengan hati-hati.", 1))
+
+    # ---- 1. ringkasan
+    L += ["", bar, " 1. RINGKASAN", bar]
+    tbl = summary_table_lines(stats, summ)
+    L.append(" " + tbl[0][0])
+    L.append(" " + thin[:57])
+    for text, _kind in tbl[1:]:
+        L.append((" " + text) if text else "")
+
+    # ---- 2. lonjakan
+    L += ["", bar, " 2. DAFTAR LONJAKAN TENSION (urut waktu)", bar]
+    if not numbered:
+        L.append(" Tidak ada lonjakan ELEVATED/HIGH pada sesi ini.")
+    else:
+        L.append(f" {'No':<4}{'Waktu':<8}{'Level':<10}{'Durasi':>8}{'Puncak':>9}{'Rata2':>8}   Pendorong")
+        L.append(" " + thin[:70])
+        details = {}
+        for n, lvl, ep in numbered:
+            details[n] = _episode_details(log_df, lvl, ep)
+            dd = details[n]
+            pk = f"{dd['peak']:+.2f}" if dd["peak"] is not None else "-"
+            mn = f"{dd['mean']:+.2f}" if dd["mean"] is not None else "-"
+            L.append(f" #{n:<3}{_mmss(ep['start']):<8}{lvl:<10}{_dur(ep['duration']):>8}{pk:>9}{mn:>8}   {dd['driver']}")
+        L.append("")
+        L.append(" Rincian tiap lonjakan:")
+        for n, lvl, ep in numbered:
+            dd = details[n]
+            L.append(thin)
+            L.append(f" #{n}  {lvl}  -  naik {_mmss(ep['start'])}, aktif sampai {_mmss(ep['end'])} (durasi {_dur(ep['duration'])})")
+            if dd["signals"]:
+                L.append(_kv("Yang bergerak", dd["signals"], 18))
+            if dd["driver"]:
+                L.append(_kv("Pendorong", dd["driver"], 18))
+            if len(log_df):
+                idx = (log_df["elapsed_seconds"] - ep["start"]).abs().idxmin()
+                fno = int(log_df.loc[idx, "frame"])
+                L.append(_kv("Frame", f"{fno:06d}  ->  session1_aligned/frame_det_00_{fno:06d}.{ALIGNED_FRAME_EXT}", 18))
+            snaps = [os.path.basename(pth) for (se, sl, pth) in tension_snapshots
+                     if sl == lvl and abs(se - ep["start"]) < 0.6]
+            if snaps:
+                L.append(_kv("Foto", "snapshots/" + ", snapshots/".join(sorted(snaps)), 18))
+            before = [(t, lab) for (t, lab) in manual_events if ep["start"] - 30 <= t <= ep["start"]]
+            if before:
+                t_mark = max(before)[0]
+                L.append(_kv("Penanda operator", f"ditandai pada {_mmss(t_mark)} ({ep['start'] - t_mark:.0f}s sebelum naik)", 18))
+        L.append(thin)
+
+    # ---- 3. operator
+    L += ["", bar, " 3. CATATAN OPERATOR (tombol '.')", bar]
+    if not manual_events:
+        L.append(" Tidak ada penanda dari operator.")
+    else:
+        for t, label in sorted(manual_events):
+            lvl_now = ""
+            if len(log_df):
+                idx = (log_df["elapsed_seconds"] - t).abs().idxmin()
+                lvl_now = f"  (level saat itu: {log_df.loc[idx, 'level']})"
+            L.append(f" {_mmss(t)}  {label}{lvl_now}")
+
+    # ---- 4. konteks percakapan
+    L += ["", bar, " 4. KONTEKS PERCAKAPAN SAAT TENSION NAIK", bar]
+    L.append(_wrap("Heuristik dari jeda bicara - BUKAN AI/LLM. Teks hasil transkripsi otomatis bisa keliru; "
+                   "cocokkan dengan rekaman (voice_recording.wav) sebelum dipakai.", 1))
+    L.append("")
+    L.append(REPORT_TRANSCRIPT_PLACEHOLDER if transcript_pending
+             else "   (Transkripsi tidak aktif sesi ini - mikrofon gagal dibuka.)")
+
+    # ---- 5. catatan
+    L += ["", bar, " 5. CATATAN PENTING", bar]
+    L.append(_wrap("Ini ringkasan POLA heuristik, BUKAN kesimpulan kejujuran/kebohongan target. Peningkatan "
+                   "tension bisa karena gugup, berpikir keras, tidak nyaman, atau sekadar berbicara. Gunakan "
+                   "sebagai satu bahan pertimbangan bersama observasi langsung dan konteks wawancara.", 1))
+    L.append("")
+    L.append(_wrap("Arti kolom tension_log.csv dan cara skor dihitung: lihat panduan_kolom.txt di folder utama "
+                   "(satu level di atas folder sesi ini).", 1))
+    L.append(bar)
+    return "\n".join(L) + "\n"
+
+
+def _cols(rows, name_w=27):
+    """Two-column list: name on the left, wrapped description on the right (a name too long
+    for the left column gets its own line instead of running into the description)."""
+    out = []
+    for name, desc in rows:
+        if len(name) >= name_w:
+            out.append(f"   {name}")
+            out.append(textwrap.fill(desc, width=REPORT_WIDTH, initial_indent="   " + " " * name_w,
+                                     subsequent_indent="   " + " " * name_w))
+        else:
+            out.append(textwrap.fill(desc, width=REPORT_WIDTH, initial_indent=f"   {name:<{name_w}}",
+                                     subsequent_indent="   " + " " * name_w))
+    return "\n".join(out)
+
+
+def _item(text):
+    """Numbered / bulleted item with a hanging indent."""
+    hang = 2 if text.startswith("- ") else 3
+    return textwrap.fill(text, width=REPORT_WIDTH, initial_indent=" ", subsequent_indent=" " * (1 + hang))
+
+
+def build_column_guide():
+    """Shared guide, generated from the real settings so it can never disagree with the code."""
+    bar, thin = "=" * REPORT_WIDTH, "-" * REPORT_WIDTH
+    au_rows = [(f"{au}  (bobot {w:.3f})", AU_HUMAN_LABELS.get(au, au))
+               for au, w in sorted(TENSION_WEIGHTS.items(), key=lambda kv: -kv[1])]
+    G = [bar, " PANDUAN MEMBACA HASIL SESI", bar,
+         _wrap("Satu file untuk semua sesi (dibuat otomatis dari pengaturan skrip, jadi selalu cocok dengan "
+               "angka yang dipakai). Dibuat untuk dibaca ahli yang belum mengenal kode AU / FACS.", 1),
+         "", " ISI", "   A. Isi folder sesi", "   B. Cara cepat membaca tension_log.csv",
+         "   C. Arti kolom tension_log.csv", "   D. Cara skor dihitung", "   E. Cara membaca report.txt",
+         "   F. Batasan penting"]
+
+    G += ["", bar, " A. ISI FOLDER SESI  (session_<tanggal_jam>\\)", bar,
+          _cols([
+              ("report.txt", "Laporan ringkas sesi: durasi, jumlah lonjakan, rincian tiap lonjakan, konteks ucapan."),
+              ("tension_log.csv", "Log lengkap, satu baris per frame yang valid (lihat bagian C)."),
+              ("voice_recording.wav", "Rekaman suara seluruh sesi (selalu direkam; dasar transkrip)."),
+              ("snapshots\\", "Foto saat tension naik (dan satu foto baseline). Nama file = level_detik_frame."),
+              ("session1.csv", "Output mentah OpenFace (semua kolom, tanpa penyaringan)."),
+              ("session1_aligned\\", "Gambar wajah hasil OpenFace per frame (frame_det_00_<nomor frame>)."),
+              ("tension_log.partial.csv", "Hanya ada jika sesi berhenti tiba-tiba: salinan log otomatis tiap "
+                                           f"{AUTOSAVE_LOG_SECONDS}s. Normalnya dihapus saat Stop."),
+          ], 24)]
+
+    G += ["", bar, " B. CARA CEPAT MEMBACA tension_log.csv", bar,
+          _item("1. Filter kolom 'level' = ELEVATED atau HIGH untuk melihat momen yang menonjol."),
+          _item("2. Cek keandalan dulu: openface_success = 1 dan openface_confidence tinggi. "
+                "Baris yang meragukan sebaiknya diabaikan."),
+          _item("3. Lihat 'dominant_signal' dan kolom AU untuk tahu gerakan wajah apa yang naik; "
+                "buka foto di kolom 'tension_snapshot' dan putar video pada 'elapsed_seconds' yang sama."),
+          _item("4. Cocokkan dengan kolom 'manual_event' (penanda operator) dan bagian konteks ucapan di report.txt.")]
+
+    G += ["", bar, " C. ARTI KOLOM tension_log.csv", bar, " Identitas baris", thin,
+          _cols([
+              ("timestamp", "Jam asli (ISO) saat baris dicatat."),
+              ("elapsed_seconds", "Detik sejak awal rekaman OpenFace (jam internal frame, bukan jam komputer). "
+                                  "Sama dengan sumbu waktu grafik, report.txt, foto, dan transkrip."),
+              ("frame", "Nomor frame OpenFace -> gambar session1_aligned/frame_det_00_<frame>."),
+          ]),
+          "", " Keandalan data  (cek ini dulu)", thin,
+          _cols([
+              ("openface_success", "1 = wajah terdeteksi, 0 = tidak. Baris 0 jangan dipakai."),
+              ("openface_confidence", f"0-1; makin tinggi makin yakin. Frame di bawah {MIN_TRACKING_CONFIDENCE} sudah "
+                                      "otomatis dibuang dan tidak muncul di log."),
+          ]),
+          "", " Sinyal wajah mentah - Action Units (0 sampai ~5, makin tinggi makin kuat)", thin,
+          _cols([
+              ("AU04_brow_lowerer", "Alis turun/mengerut (mengernyit)"),
+              ("AU09_nose_wrinkler", "Hidung mengerut (jijik/tidak nyaman)"),
+              ("AU10_upper_lip_raiser", "Bibir atas terangkat"),
+              ("AU20_lip_stretcher", "Bibir tertarik ke samping (tegang)"),
+              ("AU15_lip_corner_depressor", "Sudut bibir turun (murung/kecewa)"),
+              ("AU05_upper_lid_raiser", "Mata melebar (terkejut/waspada)"),
+              ("dominant_signal", "AU yang paling besar sumbangannya ke au_score pada baris itu = jawaban singkat "
+                                  "'apa yang bergerak'."),
+          ]),
+          "", " Gaze (arah pandangan)", thin,
+          _cols([
+              ("gaze_angle_x / _y", "Sudut pandangan mata mentah (radian)."),
+              ("gaze_variance_score", f"Seberapa banyak arah pandangan berubah dalam {GAZE_WINDOW} frame terakhir "
+                                      "(mata tidak stabil)."),
+          ]),
+          "", " Suara (terisi hanya jika 'Enable Voice Detection' aktif)", thin,
+          _cols([
+              ("voice_pitch_mean_hz", "Rata-rata nada suara (Hz)."),
+              ("voice_pitch_variability", "Naik-turunnya nada."),
+              ("voice_jitter", "Ketidakstabilan siklus pitch (getaran suara)."),
+              ("voice_pause_ratio", "Proporsi jeda/diam pada potongan suara itu."),
+              ("voice_intensity_variability", "Naik-turunnya volume."),
+          ]),
+          "", " Skor (hasil hitungan, bukan data mentah)", thin,
+          _cols([
+              ("au_score", "Wajah saja: jumlah (AU x bobot)."),
+              ("voice_score", "Suara saja (0 jika analisis suara OFF)."),
+              ("raw_score", "Gabungan sebelum dibandingkan ke baseline."),
+              ("baseline", "Rata-rata raw_score selama kalibrasi = 'kondisi normal' target ini."),
+              ("relative_score", "raw_score - baseline. 0 = sama seperti kondisi awal (bukan skala mutlak)."),
+              ("smoothed_score", f"relative_score dirata-rata {WINDOW_SIZE} baris terakhir. INI garis utama di layar."),
+              ("visual_smoothed / voice_smoothed", "Versi per-channel (wajah / suara) untuk melihat siapa pendorongnya."),
+              ("level", "BELOW / BASELINE / ELEVATED / HIGH dari smoothed_score, dengan ambang yang sama seperti "
+                        "di layar."),
+          ]),
+          "", " Catatan operator & foto", thin,
+          _cols([
+              ("manual_event", "Terisi hanya di baris terdekat dengan saat operator menekan '.'; lainnya kosong."),
+              ("tension_snapshot", "Nama file foto yang diambil saat skor naik ke ELEVATED/HIGH (di folder "
+                                   "snapshots). Kosong di baris lain."),
+          ])]
+
+    G += ["", bar, " D. CARA SKOR DIHITUNG", bar,
+          _wrap("Skor wajah = jumlah (intensitas AU x bobot) + variasi gaze x "
+                f"{GAZE_VARIANCE_WEIGHT:g}. Bobot AU berasal dari data (ukuran efek Cohen's d, dataset RAVDESS):", 1),
+          "", _cols(au_rows, 30), "",
+          _wrap(f"Jika analisis suara aktif, skor gabungan = wajah x {VISUAL_CHANNEL_WEIGHT:g} + suara x "
+                f"{VOICE_CHANNEL_WEIGHT:g}; jika tidak, wajah dihitung penuh.", 1), "",
+          _wrap(f"Baseline: {BASELINE_DURATION_SECONDS} detik pertama (target diminta netral). Setelah itu skor "
+                "ditampilkan sebagai selisih dari baseline, lalu dihaluskan.", 1), "",
+          _wrap(f"Level: ELEVATED jika smoothed >= {ELEVATED_THRESHOLD:.1f}; HIGH jika >= {HIGH_THRESHOLD:.1f}; BELOW "
+                f"jika <= -{ELEVATED_THRESHOLD:.1f}; selain itu BASELINE. Angka ini heuristik, belum divalidasi.", 1), "",
+          _wrap(f"Lonjakan (episode): satu masuk ke ELEVATED/HIGH = satu lonjakan; baru dianggap selesai setelah "
+                f"skor turun di bawah ambang selama {LEVEL_EXIT_COOLDOWN_SECONDS:g} detik. "
+                + ("Satu rangkaian ELEVATED/HIGH yang berkelanjutan dihitung SATU lonjakan (level tertinggi)."
+                   if MERGE_ELEVATED_HIGH_EPISODES else
+                   "Pindah ELEVATED <-> HIGH dihitung lonjakan baru."), 1)]
+
+    G += ["", bar, " E. CARA MEMBACA report.txt", bar,
+          _cols([
+              ("1. Ringkasan", "Berapa kali & berapa lama ELEVATED/HIGH, skor puncak, porsi waktu per level."),
+              ("2. Daftar lonjakan", "Tabel #1, #2, ... lalu rincian: apa yang bergerak, wajah vs suara, nomor "
+                                     "frame, foto, penanda operator terdekat."),
+              ("3. Catatan operator", "Semua penanda tombol '.' beserta level saat itu."),
+              ("4. Konteks percakapan", "Apa yang sedang dibicarakan di sekitar tiap lonjakan (merujuk nomor #). "
+                                        "Diisi otomatis setelah transkrip selesai (sekitar 1 menit setelah Stop)."),
+          ], 24)]
+
+    G += ["", bar, " F. BATASAN PENTING", bar,
+          _item("- Semua ini ringkasan pola heuristik, BUKAN kesimpulan kejujuran/kebohongan target."),
+          _item("- Bicara sendiri menggerakkan bibir (AU10/AU15/AU20) dan bisa menaikkan skor; baseline yang "
+                "diambil saat diam bisa membuat ucapan biasa tampak seperti kenaikan."),
+          _item("- Transkrip otomatis bisa keliru, terutama nama, istilah, dan campuran bahasa."),
+          _item("- Gunakan bersama observasi langsung dan konteks wawancara."), bar]
+    return "\n".join(G) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +1294,8 @@ def start_openface(event):
     global visual_baseline_mean, voice_baseline_mean
     global session_id, session_dir, current_csv_path, current_log_path, current_snapshot_dir, current_voice_path
     global transcriber, voice_session_start
+    global first_video_ts, last_reliable_wall, face_lost, _openface_exit_reported
+    global rows_seen, rows_unreliable
 
     if session_started:
         return  # already running, ignore repeated clicks
@@ -768,9 +1317,10 @@ def start_openface(event):
 
     try:
         openface_process = subprocess.Popen([
-            OPENFACE_EXE, "-device", "0",
+            OPENFACE_EXE, "-device", str(WEBCAM_DEVICE_INDEX),
             "-out_dir", session_dir,
             "-of", "session1",
+            *OPENFACE_EXTRA_ARGS,
             # "-cam_width", "150",   # smaller capture/display resolution
             # "-cam_height", "150",  # reduces CPU load, still enough for AU detection
         ])
@@ -783,26 +1333,19 @@ def start_openface(event):
     # shows" issue when voice is on - safe to remove once resolved.
     print(f"DEBUG: OpenFace process started, PID={openface_process.pid}")
 
-    # "Enable Voice Detection" (voice_enabled), "Always Record Audio"
-    # (voice_record_enabled), and "Enable Transcription" (transcription_enabled)
-    # are three independent toggles - any one alone is enough reason to open
-    # the mic stream. Recording, stress-scoring, and transcription are then
-    # switched on/off separately (recording/analysis inside VoiceAnalyzer,
-    # transcription via the attached Transcriber below), so a session can
-    # run any combination of the three, including just one alone.
-    if voice_enabled or voice_record_enabled or transcription_enabled:
+    # The mic stream is opened every session: audio is always recorded (the
+    # transcript is made from the recording), while "Enable Voice Detection"
+    # (voice_enabled) only decides whether the stress-scoring analysis runs.
+    if voice_enabled or transcription_enabled:
         voice_analyzer = VoiceAnalyzer()
         try:
             print(f"DEBUG: calling voice_analyzer.start() "
                   f"(analysis_enabled={voice_enabled}, "
-                  f"recording={'on' if voice_record_enabled else 'off'}, "
+                  f"recording=on, "
                   f"transcription={'on' if transcription_enabled else 'off'})...")
             voice_session_start = time.time()
-            # The post-session AssemblyAI transcript is made FROM the saved
-            # recording, so transcription turns recording on by itself.
-            _need_wav = voice_record_enabled or (transcription_enabled and TRANSCRIBER_BACKEND == "assemblyai_async")
             voice_analyzer.start(
-                record_path=current_voice_path if _need_wav else None,
+                record_path=current_voice_path,   # always recorded
                 analysis_enabled=voice_enabled,
             )
             print("DEBUG: voice_analyzer.start() returned - main thread continuing normally.")
@@ -823,8 +1366,8 @@ def start_openface(event):
         transcriber = Transcriber()
         transcriber.start()
         voice_analyzer.set_transcriber(transcriber)
-        transcript_text.set_text("Menunggu ucapan...")
-        transcript_text.set_color("dimgray")
+        # transcript_text.set_text("Menunggu...")
+        # transcript_text.set_color("dimgray")
     else:
         transcriber = None
         if transcription_enabled:
@@ -835,6 +1378,16 @@ def start_openface(event):
 
     # full reset so Start -> Stop -> Start again behaves as a clean new session
     start_time = None
+    first_video_ts = None
+    rows_seen = 0
+    rows_unreliable = 0
+    last_reliable_wall = None
+    face_lost = False
+    _openface_exit_reported = False
+    _transcript_entries.clear()   # else a window resize would redraw the PREVIOUS session's transcript
+    _autosave["last"] = time.time()
+    _autosave["written"] = 0
+    big_status_text.set_fontsize(26)
     baseline_established = False
     baseline_mean = None
     baseline_scores.clear()
@@ -863,6 +1416,7 @@ def start_openface(event):
         vline.remove()
     manual_event_lines.clear()
     log_rows = []
+    _clear_session_table()
     conclusion_prefix_text.set_text("Menunggu data timeframe...")
     conclusion_level_text.set_text("")
     conclusion_level_text.set_visible(True)
@@ -882,7 +1436,7 @@ def start_openface(event):
 
 
 def stop_openface(event):
-    global openface_process, voice_analyzer, session_started, transcriber, _voice_stop_thread
+    global openface_process, voice_analyzer, session_started, transcriber, _voice_stop_thread, _transcript_thread
 
     if not session_started:
         return  # nothing running
@@ -932,23 +1486,35 @@ def stop_openface(event):
     # way). The post-session context list is built here regardless of
     # whether "Show Live Transcript" was ever turned on during the session
     # - transcription is always on.
+    report_ready = threading.Event()   # set once report.txt exists, so the transcript thread can fill in section 4
+    transcript_pending = False
     if transcriber is not None:
+        transcript_pending = True
         transcriber_to_finalize = transcriber
         transcriber = None
         episodes_snapshot = {lvl: list(level_tracker.episodes[lvl]) for lvl in ("ELEVATED", "HIGH")}
         report_path_candidate = os.path.join(session_dir, "report.txt") if (session_dir and log_rows) else None
-        threading.Thread(
+        # NOT a daemon thread: if the window is closed before the transcript is ready,
+        # the program waits for it (see the end of the file) so report.txt still gets it.
+        _transcript_thread = threading.Thread(
             target=_finalize_transcript_and_context,
             args=(transcriber_to_finalize, episodes_snapshot, report_path_candidate,
                   _voice_stop_thread, current_voice_path,
-                  (start_time - voice_session_start) if (start_time and voice_session_start) else 0.0),
-            daemon=True,
-        ).start()
+                  (start_time - voice_session_start) if (start_time and voice_session_start) else 0.0,
+                  report_ready, number_episodes(episodes_snapshot)[1]),
+            daemon=False,
+        )
+        _transcript_thread.start()
         transcript_text.set_text(
-            "Mengirim rekaman ke AssemblyAI...\n(biasanya kurang dari 1 menit setelah\nupload selesai)"
+            "Memproses transkrip..."
             if TRANSCRIBER_BACKEND == "assemblyai_async"
-            else "Menyelesaikan transkrip...\n(berjalan di latar belakang)")
+            else "Menyelesaikan transkrip...")
         transcript_text.set_color("dimgray")
+
+    # give any snapshot still being copied a moment to finish, so it gets tagged in the log
+    _deadline = time.time() + 1.5
+    for _t in list(_snapshot_threads):
+        _t.join(timeout=max(0.0, _deadline - time.time()))
 
     # save whatever was captured this session, without needing to close the window
     if log_rows:
@@ -973,163 +1539,30 @@ def stop_openface(event):
 
         log_df.to_csv(current_log_path, index=False)
         print(f"Session log saved to {current_log_path} ({len(log_df)} rows)")
+        try:   # the final log is complete, the autosave copy is no longer needed
+            os.remove(os.path.join(session_dir, "tension_log.partial.csv"))
+        except OSError:
+            pass
         ax.set_title(f"Stopped. Log saved: {os.path.basename(session_dir)}/{os.path.basename(current_log_path)}")
 
-        # Plain-language column guide, saved alongside the CSV - the log
-        # is meant to be handed to a domain expert for validation, who
-        # may not know FACS AU codes or this project's internal scoring
-        # terms, so the raw column headers alone aren't self-explanatory.
-        column_guide = """PANDUAN KOLOM - tension_log
-============================================
-
-Setiap baris = satu momen (satu frame OpenFace yang valid/reliable).
-
-IDENTITAS BARIS
-  timestamp             Waktu asli (jam:menit:detik) saat baris ini dicatat.
-  elapsed_seconds        Detik sejak sesi dimulai (dipakai untuk cocokkan ke video).
-  frame                  Nomor frame OpenFace.
-
-KEANDALAN DATA (cek ini dulu sebelum menilai angka lain di baris yang sama)
-  openface_success       1 = wajah terdeteksi, 0 = tidak - baris dengan 0
-                         sebaiknya diabaikan, datanya tidak valid.
-  openface_confidence    0-1, makin tinggi makin yakin OpenFace terhadap
-                         deteksi wajah pada frame ini. Baris dengan angka
-                         rendah (di bawah ambang MIN_TRACKING_CONFIDENCE
-                         pada skrip) sudah difilter otomatis dan TIDAK
-                         akan muncul di log ini sama sekali.
-
-SINYAL WAJAH MENTAH (Action Units - intensitas 0 s/d ~5, makin tinggi
-makin kuat gerakan otot tsb, INI YANG PALING PENTING untuk validasi -
-bisa dicocokkan langsung ke rekaman video pada elapsed_seconds yang sama)
-  AU04_brow_lowerer          Alis turun/mengerut (mengernyit)
-  AU09_nose_wrinkler         Hidung mengerut (jijik/tidak nyaman)
-  AU10_upper_lip_raiser      Bibir atas terangkat
-  AU20_lip_stretcher         Bibir tertarik ke samping (tegang)
-  AU15_lip_corner_depressor  Sudut bibir turun (murung/kecewa)
-  AU05_upper_lid_raiser      Mata melebar (terkejut/waspada)
-  dominant_signal            AU mana yang paling besar kontribusinya ke
-                             au_score pada baris ini - jawaban singkat
-                             "apa yang bergerak" tanpa perlu baca semua
-                             angka AU di atas satu per satu.
-
-SINYAL GAZE (arah pandangan) MENTAH
-  gaze_angle_x / gaze_angle_y   Sudut pandangan mata mentah (radian).
-  gaze_variance_score            Seberapa banyak arah pandangan berubah-
-                                 ubah baru-baru ini (mata tidak stabil).
-
-SUARA (hanya terisi jika Enable Voice Detection aktif saat sesi)
-  voice_pitch_mean_hz            Rata-rata nada suara (Hz).
-  voice_pitch_variability        Seberapa naik-turun nada suara.
-  voice_jitter                   Ketidakstabilan siklus pitch (getaran suara).
-  voice_pause_ratio               Proporsi jeda/diam dalam potongan suara ini.
-  voice_intensity_variability    Naik-turunnya volume suara.
-
-SKOR GABUNGAN (hasil perhitungan, bukan data mentah)
-  au_score               Wajah saja, dari AU x bobotnya masing-masing.
-  voice_score            Suara saja (0 jika voice detection nonaktif).
-  raw_score               au_score + gaze_variance_score + voice_score,
-                          sebelum dibandingkan ke baseline.
-  baseline                Nilai raw_score rata-rata selama kalibrasi awal
-                          (dipakai sebagai "kondisi normal" target ini).
-  relative_score          raw_score - baseline (jadi 0 = sama seperti
-                          kondisi awal target, bukan skala mutlak).
-  smoothed_score          relative_score yang dihaluskan (rata-rata
-                          beberapa baris terakhir) - INI yang ditampilkan
-                          di grafik utama layar.
-  visual_smoothed / voice_smoothed   Versi smoothed per-channel saja,
-                          untuk melihat wajah vs suara secara terpisah.
-  level                   Klasifikasi smoothed_score: BASELINE / ELEVATED
-                          / HIGH / BELOW, memakai ambang batas yang sama
-                          dengan yang tampil di layar - tidak perlu
-                          hitung manual.
-
-CATATAN OPERATOR
-  manual_event            Diisi HANYA pada baris yang paling dekat
-                          waktunya dengan saat operator menekan tombol
-                          tanda (biasanya '.') selama sesi. Baris lain
-                          kosong. Pakai ini untuk mencocokkan lonjakan
-                          skor dengan momen spesifik yang dicatat operator
-                          (mis. "pertanyaan baru diajukan").
-
-FOTO OTOMATIS
-  tension_snapshot        Nama file foto yang diambil OTOMATIS tepat saat
-                          skor naik masuk ke ELEVATED atau HIGH (bukan
-                          difoto terus-menerus selama level itu aktif,
-                          hanya di titik awal kenaikannya). File foto ada
-                          di dalam folder "snapshots" pada folder sesi
-                          yang sama (session_<tanggal_jam>\\snapshots\\) -
-                          folder sesi yang sama juga berisi tension_log.csv
-                          dan report.txt ini, jadi satu folder sesi = satu
-                          sesi lengkap (CSV OpenFace, log, report, foto).
-                          Buka file ini untuk melihat langsung ekspresi
-                          wajah pada momen tersebut. Baris lain (tanpa
-                          kenaikan level) kosong.
-
-CATATAN FILE INI
-  Panduan ini SATU file yang dipakai bersama untuk semua sesi (disimpan
-  di folder utama C:\\OpenFace\\live_output\\, bukan di dalam folder
-  sesi masing-masing), karena isinya sama untuk setiap sesi.
-
-PENTING: Semua ini adalah ringkasan pola heuristik, BUKAN kesimpulan
-kejujuran/kebohongan target. Gunakan sebagai salah satu bahan
-pertimbangan tambahan bersama observasi langsung dan konteks wawancara.
-"""
-        # Shared across every session - written once, not regenerated (and
-        # not overwritten) on each run, since its content doesn't depend
-        # on any particular session.
-        if not os.path.exists(GUIDE_PATH):
-            try:
+        # Shared column guide - generated from the real settings; rewritten only when its text changed.
+        guide_text = build_column_guide()
+        try:
+            guide_current = False
+            if os.path.exists(GUIDE_PATH):
+                with open(GUIDE_PATH, "r", encoding="utf-8") as f:
+                    guide_current = (f.read() == guide_text)
+            if guide_current:
+                print(f"Column guide already up to date at {GUIDE_PATH}")
+            else:
                 with open(GUIDE_PATH, "w", encoding="utf-8") as f:
-                    f.write(column_guide)
+                    f.write(guide_text)
                 print(f"Column guide saved to {GUIDE_PATH}")
-            except Exception as e:
-                print(f"Could not save column guide: {e}")
-        else:
-            print(f"Column guide already exists at {GUIDE_PATH} (shared across sessions, not rewritten)")
+        except Exception as e:
+            print(f"Could not save column guide: {e}")
 
-        # ---- End-of-session episode report ----
-        report_lines = [
-            f"RINGKASAN SESI (total durasi: {end_t:.0f} detik)",
-            f"ELEVATED: {stats['ELEVATED']['count']}x kejadian, total {stats['ELEVATED']['total_duration']:.0f}s, "
-            f"terlama {stats['ELEVATED']['longest']:.0f}s",
-            f"HIGH: {stats['HIGH']['count']}x kejadian, total {stats['HIGH']['total_duration']:.0f}s, "
-            f"terlama {stats['HIGH']['longest']:.0f}s",
-            "",
-        ]
-
-        # Frame-level trace: for each ELEVATED/HIGH episode, find the
-        # OpenFace frame number closest to the exact moment the episode
-        # started (same "nearest elapsed_seconds" match already used above
-        # for manual_event/tension_snapshot) - this is what actually lets
-        # someone jump to session1_aligned/frame_det_00_<frame>.* and see
-        # the aligned face crop at the instant tension rose into that level,
-        # not just a timestamp they'd have to convert themselves.
-        report_lines.append("RINCIAN FRAME SAAT TENSION NAIK KE LEVEL (untuk dicocokkan ke session1_aligned/):")
-        any_episode = False
-        for lvl in ("ELEVATED", "HIGH"):
-            for i, ep in enumerate(level_tracker.episodes[lvl], start=1):
-                any_episode = True
-                if len(log_df):
-                    nearest_idx = (log_df["elapsed_seconds"] - ep["start"]).abs().idxmin()
-                    frame_no = int(log_df.loc[nearest_idx, "frame"])
-                    frame_note = (f"frame {frame_no:06d} -> session1_aligned/frame_det_00_{frame_no:06d}.*")
-                else:
-                    frame_note = "frame tidak diketahui (log kosong)"
-                report_lines.append(
-                    f"  {lvl} #{i}: naik pada {ep['start']:.1f}s "
-                    f"(aktif sampai {ep['end']:.1f}s, durasi {ep['duration']:.1f}s) -> {frame_note}"
-                )
-        if not any_episode:
-            report_lines.append("  (tidak ada episode ELEVATED/HIGH pada sesi ini)")
-        report_lines.append("")
-
-        report_lines.append(
-            "Catatan: hitungan ini menunjukkan berapa kali pola tension naik ke level tersebut "
-            "secara terpisah (bukan jumlah pembacaan individual). Ini adalah ringkasan pola, "
-            "BUKAN kesimpulan kejujuran/kebohongan target. Gunakan sebagai salah satu bahan "
-            "pertimbangan bersama observasi langsung dan konteks wawancara."
-        )
-        report_text_full = "\n".join(report_lines)
+        # ---- End-of-session report ----
+        report_text_full = build_report_text(log_df, stats, end_t, datetime.now(), transcript_pending)
         print(report_text_full)
 
         report_path = os.path.join(session_dir, "report.txt")
@@ -1140,34 +1573,31 @@ pertimbangan tambahan bersama observasi langsung dan konteks wawancara.
         except Exception as e:
             print(f"Could not save report file: {e}")
 
-        # repurpose the Summary panel to show the final session totals,
-        # replacing the periodic timeframe summary now that the session is over
-        conclusion_prefix_text.set_text("RINGKASAN SESI:")
-        conclusion_level_text.set_visible(False)
-        session_elevated_text.set_text("Elevated")
-        session_elevated_count_text.set_text(f"{stats['ELEVATED']['count']}x")
-        session_high_text.set_text("High")
-        session_high_count_text.set_text(f"{stats['HIGH']['count']}x")
-        session_elevated_text.set_visible(True)
-        session_elevated_count_text.set_visible(True)
-        session_separator_text.set_visible(True)
-        session_high_text.set_visible(True)
-        session_high_count_text.set_visible(True)
-        conclusion_detail_text.set_text(
-            f"Elevated: {stats['ELEVATED']['total_duration']:.0f}s total, "
-            f"terlama {stats['ELEVATED']['longest']:.0f}s\n"
-            f"High: {stats['HIGH']['total_duration']:.0f}s total, "
-            f"terlama {stats['HIGH']['longest']:.0f}s"
-        )
-        conclusion_note_text.set_text(
-            "Bukan kesimpulan kejujuran\npertimbangkan dengan konteks wawancara."
-        )
+        # repurpose the Summary panel to show the final session summary (same numbers
+        # as section 1 of report.txt), replacing the periodic timeframe summary
+        show_session_table(summary_table_lines(stats, compute_session_summary(log_df), compact=True))
     else:
         ax.set_title("Stopped. No data logged this session.")
 
     start_button.label.set_text("Start OpenFace")
-    fig.canvas.draw_idle()
+    report_ready.set()   # report.txt is written (or there is none) - the transcript thread may append now
+    try:
+        fig.canvas.draw_idle()
+    except Exception:
+        pass   # window already closing
     print("Session stopped.")
+
+
+def _on_window_close(event):
+    """Closing the window mid-session = Stop (saves log + report, starts the transcript)."""
+    if session_started:
+        try:
+            stop_openface(None)
+        except Exception as e:
+            print(f"Error while stopping on window close: {e}")
+
+
+fig.canvas.mpl_connect("close_event", _on_window_close)
 
 
 button_ax = plt.axes([0.476, 0.25, 0.15, 0.075])
@@ -1251,7 +1681,7 @@ def toggle_voice(label):
 # (below) can sit beside it in the same row, rather than stacking - the
 # row directly below this one is the full-width legend panel, so there's
 # no vertical room to add a second row here.
-voice_toggle_ax = plt.axes([0.547, 0.194, 0.36, 0.06])
+voice_toggle_ax = plt.axes([0.542, 0.182, 0.36, 0.06])
 voice_toggle_ax.set_zorder(10)
 voice_toggle_ax.set_frame_on(False)
 
@@ -1267,48 +1697,10 @@ voice_toggle = CheckButtons(
 
 # Adjust label text position and font size so it doesn't overlap the box
 voice_toggle.labels[0].set_x(0.18)
-voice_toggle.labels[0].set_fontsize(7)
+voice_toggle.labels[0].set_fontsize(9)
 
 # Attach callback function
 voice_toggle.on_clicked(toggle_voice)
-
-
-# ---------------------------------------------------------------------------
-# "Always Record Audio" toggle - a separate, explicitly-labeled control for
-# saving the session's .wav. Deliberately kept independent from
-# "Enable Voice Detection" above: that checkbox only controls whether the
-# pitch/jitter/pause-ratio stress SCORING runs, so an operator unchecking
-# it should not be surprised to find audio was captured anyway. Whether a
-# .wav gets saved at all is this checkbox, and only this checkbox - visible
-# and explicit, not a side effect of the other one.
-# Only takes effect the NEXT time "Start OpenFace" is clicked, same as the
-# voice-detection toggle above.
-# ---------------------------------------------------------------------------
-def toggle_voice_recording(label):
-    global voice_record_enabled
-    voice_record_enabled = not voice_record_enabled
-    print(f"Always Record Audio {'enabled' if voice_record_enabled else 'disabled'} - takes effect on next Start.")
-
-
-# Same row as voice_toggle_ax, placed immediately to its right (0.547 +
-# 0.175 = 0.722 start), so both checkboxes occupy the same overall
-# footprint the single wider checkbox used to.
-voice_record_toggle_ax = plt.axes([0.561, 0.170, 0.36, 0.06])
-voice_record_toggle_ax.set_zorder(10)
-voice_record_toggle_ax.set_frame_on(False)
-
-voice_record_toggle = CheckButtons(
-    voice_record_toggle_ax,
-    ["Record Audio"],
-    [False],
-    frame_props={'sizes': [75], 'linewidth': 1},
-    check_props={'sizes': [30], 'linewidth': 1}
-)
-
-voice_record_toggle.labels[0].set_x(0.18)
-voice_record_toggle.labels[0].set_fontsize(7)
-
-voice_record_toggle.on_clicked(toggle_voice_recording)
 
 
 # ---------------------------------------------------------------------------
@@ -1387,6 +1779,7 @@ def on_timeframe_change(label):
     global selected_timeframe_seconds, last_conclusion_bucket
     selected_timeframe_seconds = TIMEFRAME_OPTIONS[label]
     last_conclusion_bucket = -1  # force a fresh summary on the next full window
+    _clear_session_table()
     conclusion_prefix_text.set_text("Menunggu data timeframe...")
     conclusion_level_text.set_text("")
     conclusion_level_text.set_visible(True)
@@ -1433,14 +1826,9 @@ def update_voice_panel():
     features directly (independent of the video frame rate, since audio
     chunks are computed on their own ~2s cadence)."""
     if not voice_enabled:
-        # Stress-analysis scoring is off, but recording may still be
-        # running independently (see "Always Record Audio") - say so,
-        # rather than a flat "OFF" that would wrongly suggest nothing
-        # is being captured at all this session.
-        if voice_record_enabled:
-            voice_text.set_text("Voice detection:\nOFF (unchecked)\n\nAudio IS being\nrecorded this\nsession.")
-        else:
-            voice_text.set_text("Voice detection:\nOFF\n(unchecked)")
+        # Stress-analysis scoring is off, but audio is still being recorded
+        # (always, for the transcript) - say so rather than a flat "OFF".
+        voice_text.set_text("Voice detection:\nOFF (unchecked)\n\nAudio IS being\nrecorded this\nsession.")
         return
     if voice_analyzer is None:
         voice_text.set_text("Voice channel:\nnot running")
@@ -1512,12 +1900,13 @@ def update_big_status():
     """Updates the large glanceable status word + trend arrow, using the
     CURRENT smoothed score (not a periodic timeframe average) - meant to
     reflect 'right now', readable without needing to parse any numbers."""
-    if len(plot_scores) == 0:
+    if len(plot_scores) == 0 or face_lost:
         return
 
     current_value = plot_scores[-1]
     level = classify_full(current_value)
 
+    big_status_text.set_fontsize(26)
     big_status_text.set_text(STATUS_LABELS_ID[level])
     big_status_text.set_color(level_color(current_value))
 
@@ -1640,6 +2029,76 @@ conclusion_note_text = summary_panel_ax.text(
     transform=summary_panel_ax.transAxes,
 )
 
+# ---------------------------------------------------------------------------
+# End-of-session table in the Summary panel (same block as section 1 of
+# report.txt). Monospace so the columns line up; the font shrinks until the
+# whole table fits the panel (so it works at any window size) and is re-fitted
+# when the window is resized.
+# ---------------------------------------------------------------------------
+SUMMARY_TABLE_FONT_SIZES = (12.0, 11.0, 10.0, 9.5, 9.0, 8.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0)   # biggest that fits is used
+SUMMARY_TABLE_SIDE_MARGIN = 0.035
+SUMMARY_TABLE_LINE_SPACING = 1.28   # line height = font size x this
+SUMMARY_TABLE_COLORS = {"header": "dimgray", "ELEVATED": "#c77700", "HIGH": "#b00020", "text": "black"}
+_summary_table_artists = []
+_summary_table_rows = None
+
+
+def _clear_session_table():
+    """Removes the end-of-session table and brings the normal periodic summary texts back."""
+    global _summary_table_rows
+    for t in _summary_table_artists:
+        t.remove()
+    _summary_table_artists.clear()
+    _summary_table_rows = None
+    conclusion_prefix_text.set_visible(True)
+    conclusion_detail_text.set_visible(True)
+    conclusion_note_text.set_visible(True)
+
+
+def _render_session_table():
+    for t in _summary_table_artists:
+        t.remove()
+    _summary_table_artists.clear()
+    if not _summary_table_rows:
+        return
+    renderer = fig.canvas.get_renderer()
+    bbox = summary_panel_ax.get_window_extent()
+    max_w = bbox.width * (1 - 2 * SUMMARY_TABLE_SIDE_MARGIN)
+    avail_h = bbox.height * 0.94
+    fp = conclusion_prefix_text.get_fontproperties().copy()
+    fp.set_family("monospace")
+
+    chosen = SUMMARY_TABLE_FONT_SIZES[-1]
+    for fs in SUMMARY_TABLE_FONT_SIZES:
+        fp.set_size(fs)
+        widest = max(renderer.get_text_width_height_descent(txt, fp, False)[0] for txt, _k in _summary_table_rows)
+        line_h = fs * SUMMARY_TABLE_LINE_SPACING * fig.dpi / 72.0
+        if widest <= max_w and line_h * len(_summary_table_rows) <= avail_h:
+            chosen = fs
+            break
+    line_h = chosen * SUMMARY_TABLE_LINE_SPACING * fig.dpi / 72.0
+    for i, (txt, kind) in enumerate(_summary_table_rows):
+        y = 0.97 - (i * line_h) / bbox.height
+        _summary_table_artists.append(summary_panel_ax.text(
+            SUMMARY_TABLE_SIDE_MARGIN, y, txt, fontsize=chosen, family="monospace", va="top", ha="left",
+            fontweight="bold" if kind in ("header", "ELEVATED", "HIGH") else "normal",
+            color=SUMMARY_TABLE_COLORS.get(kind, "black"), transform=summary_panel_ax.transAxes, clip_on=True,
+        ))
+
+
+def show_session_table(rows):
+    """rows = [(text, kind), ...] from summary_table_lines()."""
+    global _summary_table_rows
+    _summary_table_rows = [r for r in rows if r[0]]
+    for t in (conclusion_prefix_text, conclusion_level_text, conclusion_detail_text, conclusion_note_text,
+              session_elevated_text, session_elevated_count_text, session_separator_text,
+              session_high_text, session_high_count_text):
+        t.set_visible(False)
+    _render_session_table()
+
+
+fig.canvas.mpl_connect("resize_event", lambda _e: _render_session_table() if _summary_table_rows else None)
+
 disclaimer_note = fig.text(
     0.73, 0.005,
     "Heuristic pattern summary only - not a determination of nervousness, honesty, or intent.",
@@ -1698,7 +2157,9 @@ def update_conclusion():
     if max_t < selected_timeframe_seconds:
         return  # not enough data yet for a full window
 
-    window_start = current_bucket * selected_timeframe_seconds
+    # summarise the window that has just FINISHED (the previous bucket). The old
+    # code used the bucket that had only just started, i.e. ~0.5 s of data.
+    window_start = (current_bucket - 1) * selected_timeframe_seconds
     window_vals = [y for t, y in all_points if window_start <= t < window_start + selected_timeframe_seconds]
     if not window_vals:
         return
@@ -1754,13 +2215,82 @@ def show_quick_summary():
 # session_started so nothing runs until the button is clicked, plus gaze
 # and voice scoring layered into the existing compute step
 # ---------------------------------------------------------------------------
+_LOG_FIELDS = [
+    "timestamp", "elapsed_seconds", "frame", "openface_success", "openface_confidence",
+    "AU04_brow_lowerer", "AU09_nose_wrinkler", "AU10_upper_lip_raiser", "AU20_lip_stretcher",
+    "AU15_lip_corner_depressor", "AU05_upper_lid_raiser", "dominant_signal",
+    "gaze_angle_x", "gaze_angle_y", "au_score", "gaze_variance_score", "voice_score", "raw_score",
+    "baseline", "relative_score", "smoothed_score", "visual_smoothed", "voice_smoothed", "level",
+    "voice_pitch_mean_hz", "voice_pitch_variability", "voice_jitter", "voice_pause_ratio",
+    "voice_intensity_variability",
+]
+
+
+def autosave_log():
+    """Appends the rows logged since the last autosave to tension_log.partial.csv (local only)."""
+    if AUTOSAVE_LOG_SECONDS <= 0 or not session_started or not session_dir:
+        return
+    now = time.time()
+    if now - _autosave["last"] < AUTOSAVE_LOG_SECONDS:
+        return
+    _autosave["last"] = now
+    new_rows = log_rows[_autosave["written"]:]
+    if not new_rows:
+        return
+    path = os.path.join(session_dir, "tension_log.partial.csv")
+    try:
+        write_header = _autosave["written"] == 0 or not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=_LOG_FIELDS, extrasaction="ignore")
+            if write_header:
+                w.writeheader()
+            w.writerows(new_rows)
+        _autosave["written"] += len(new_rows)
+    except Exception as e:
+        print(f"Autosave failed (will retry): {e}")
+
+
+def _update_face_lost_indicator():
+    """If no reliable face frame arrives for FACE_LOST_SECONDS, say so, instead of leaving the
+    last status (e.g. 'STABIL') on screen as if it were still current."""
+    global face_lost
+    if last_reliable_wall is None:
+        return
+    if time.time() - last_reliable_wall > FACE_LOST_SECONDS:
+        face_lost = True
+        big_status_text.set_fontsize(16)
+        big_status_text.set_text("WAJAH HILANG")
+        big_status_text.set_color("dimgray")
+        trend_arrow_text.set_text("")
+    elif face_lost:
+        face_lost = False   # update_big_status repaints the real status
+
+
+def _check_openface_alive():
+    global _openface_exit_reported
+    if openface_process is None or _openface_exit_reported:
+        return
+    code = openface_process.poll()
+    if code is not None:
+        _openface_exit_reported = True
+        msg = f"ERROR: OpenFace berhenti (kode {code}) - cek kamera, lalu Stop & Start lagi"
+        print(msg)
+        ax.set_title(msg)
+
+
 def update_plot(frame_num):
     global last_row_count, baseline_mean, baseline_established, start_time
     global csv_header, csv_byte_offset
     global visual_baseline_mean, voice_baseline_mean
+    global first_video_ts, last_reliable_wall
+    global rows_seen, rows_unreliable
 
     if not session_started:
         return line,
+
+    _check_openface_alive()
+    _update_face_lost_indicator()
+    autosave_log()
 
     try:
         if not current_csv_path or not os.path.exists(current_csv_path):
@@ -1793,7 +2323,7 @@ def update_plot(frame_num):
         for au in TENSION_WEIGHTS.keys():
             if au in new_rows.columns:
                 new_rows[au] = pd.to_numeric(new_rows[au], errors='coerce')
-        for col in ("gaze_angle_x", "gaze_angle_y", "confidence", "success"):
+        for col in ("gaze_angle_x", "gaze_angle_y", "confidence", "success", "timestamp"):
             if col in new_rows.columns:
                 new_rows[col] = pd.to_numeric(new_rows[col], errors='coerce')
     except Exception as e:
@@ -1804,13 +2334,19 @@ def update_plot(frame_num):
 
     skipped_low_confidence = 0
     for _, row in new_rows.iterrows():
+        rows_seen += 1
         if not row_is_reliable(row):
             skipped_low_confidence += 1
+            rows_unreliable += 1
             continue
 
         au_score = compute_au_score(row)
         if pd.isna(au_score):
             continue  # skip rows with no valid AU data (e.g. face not detected)
+
+        last_reliable_wall = time.time()
+        _fr = row.get("frame", np.nan)
+        frame_no = int(_fr) if pd.notna(_fr) else -1
 
         gx, gy = row.get("gaze_angle_x", np.nan), row.get("gaze_angle_y", np.nan)
         if pd.notna(gx):
@@ -1845,9 +2381,19 @@ def update_plot(frame_num):
         raw_score = (visual_score * active_visual_weight) + (voice_score * active_voice_weight)
 
         now = time.time()
-        if start_time is None:
-            start_time = now
-        elapsed = now - start_time
+        ts = row.get("timestamp", np.nan)
+        if USE_VIDEO_TIMESTAMPS and pd.notna(ts):
+            # OpenFace's own clock for this frame - every row gets its true time, not
+            # the time of the batch it happened to be read in
+            if first_video_ts is None:
+                first_video_ts = float(ts)
+            if start_time is None:
+                start_time = now
+            elapsed = float(ts) - first_video_ts
+        else:
+            if start_time is None:
+                start_time = now
+            elapsed = now - start_time
 
         if not baseline_established:
             baseline_scores.append(raw_score)
@@ -1864,7 +2410,7 @@ def update_plot(frame_num):
                 # was based on - same mechanism and naming convention as the
                 # ELEVATED/HIGH episode snapshots below, just triggered once
                 # here instead of on a level transition.
-                save_tension_snapshot("BASELINE", elapsed)
+                save_tension_snapshot("BASELINE", elapsed, frame_no)
             continue
 
         relative_score = raw_score - baseline_mean
@@ -1874,7 +2420,7 @@ def update_plot(frame_num):
         was_active_level = level_tracker.active_level
         level_tracker.update(elapsed, smoothed)
         if level_tracker.active_level is not None and level_tracker.active_level != was_active_level:
-            save_tension_snapshot(level_tracker.active_level, elapsed)
+            save_tension_snapshot(level_tracker.active_level, elapsed, frame_no)
 
         # per-channel relative + smoothed scores, purely for the secondary
         # display lines - doesn't feed back into the combined score at all
@@ -1894,7 +2440,7 @@ def update_plot(frame_num):
         log_row = {
             "timestamp": datetime.now().isoformat(),
             "elapsed_seconds": round(elapsed, 2),
-            "frame": int(row.get("frame", -1)),
+            "frame": frame_no,
 
             # OpenFace's own reliability signals - lets an expert judge
             # whether a given row's data should even be trusted before
@@ -1998,6 +2544,11 @@ if voice_analyzer:
     # writing. There's also no GUI left to freeze at this point (plt.show()
     # has already returned), so blocking here costs nothing visible.
     voice_analyzer.stop()
+
+if _transcript_thread is not None and _transcript_thread.is_alive():
+    print("Menunggu transkrip selesai - jangan tutup jendela terminal...")
+    _transcript_thread.join()
+    print("Transkrip selesai.")
 
 if session_started and log_rows:
     log_df = pd.DataFrame(log_rows)
