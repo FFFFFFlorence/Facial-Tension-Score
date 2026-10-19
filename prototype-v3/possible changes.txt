@@ -1,0 +1,3 @@
+1. Since it can now have the voice recorded, connect it to an llm to then transcribe and analyzed along with the exact frame the tension rises. That way, it can be more accurate on the summary. It can analyzed the transcribe and frame to figure out the context and facial reading analysis
+
+2. visualized the summary once the session ends

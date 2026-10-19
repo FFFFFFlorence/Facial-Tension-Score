@@ -1,0 +1,27 @@
+# Core
+opencv-python>=4.8
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+
+# Voice analysis (voice_analyzer.py) - mic capture + acoustic features
+sounddevice>=0.4.6
+praat-parselmouth>=0.4.3
+
+# Transcription (transcriber.py)
+# Default backend = AssemblyAI async (recording sent after Stop; needs the
+# ASSEMBLYAI_API_KEY environment variable):
+requests>=2.31
+# Only for TRANSCRIBER_BACKEND = "openai" (live; needs OPENAI_API_KEY + credits):
+# websocket-client>=1.7
+# Optional - only if you set TRANSCRIBER_BACKEND = "local" (offline Whisper):
+# faster-whisper>=1.0.0
+
+# Identity/facial-recognition match lookup - ONLY needed for
+# prototype_OpenFace_v3_3_transcript.py (the variant that keeps the
+# identity panel). Not needed for
+# prototype_OpenFace_v3_3_transcript_no_identity.py.
+# deepface pulls in tensorflow itself, which is the slow part of this
+# install - skip this line entirely if you're only using the no-identity
+# variant.
+deepface>=0.0.90

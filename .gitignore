@@ -31,3 +31,10 @@ prototype-v3/.venv-openface03/
 prototype-v3/dump/
 prototype-v3/__pycache__/
 prototype-v3/facial recognition/
+
+#prototype-v4
+prototype-v4/.ipynb_checkpoints/
+prototype-v4/.venv-openface04/
+prototype-v4/dump/
+prototype-v4/__pycache__/
+prototype-v4/facial recognition/
