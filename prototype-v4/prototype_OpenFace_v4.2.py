@@ -1927,7 +1927,7 @@ def on_timeframe_change(label):
 # summary_panel_ax = plt.axes([0.23, 0.065, 0.13, 0.15])
 # radio_ax = plt.axes([0.73, 0.75, 0.13, 0.15])
 # summary_panel_ax = plt.axes([0.14, 0.065, 0.23, 0.115])
-radio_ax = plt.axes([0.04, 0.065, 0.065, 0.115])
+radio_ax = plt.axes([0.04, 0.065, 0.0755, 0.115])
 radio_ax.set_title("Timeframe", fontsize=9)
 timeframe_radio = RadioButtons(radio_ax, list(TIMEFRAME_OPTIONS.keys()), active=list(TIMEFRAME_OPTIONS.keys()).index(DEFAULT_TIMEFRAME_LABEL))
 timeframe_radio.on_clicked(on_timeframe_change)
@@ -2111,7 +2111,8 @@ def update_gauge():
 # Channel panel, and color-coded to match the current tension level.
 # ---------------------------------------------------------------------------
 # summary_panel_ax = plt.axes([0.73, 0.22, 0.13, 0.15])
-summary_panel_ax = plt.axes([0.125, 0.065, 0.245, 0.115])
+# summary_panel_ax = plt.axes([0.125, 0.065, 0.245, 0.115])
+summary_panel_ax = plt.axes([0.135, 0.065, 0.2355, 0.115])
 summary_panel_ax.set_title("Summary", fontsize=9)
 summary_panel_ax.set_xticks([])
 summary_panel_ax.set_yticks([])

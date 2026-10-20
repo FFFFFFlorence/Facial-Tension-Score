@@ -553,11 +553,11 @@ target_info_text = target_info_ax.text(
 # _check_transcript_finalize_result below.
 # ---------------------------------------------------------------------------
 # transcript_panel_ax = plt.axes([0.025, 0.190, 0.345, 0.660])
-# The "Now" gauge (gauge_ax, further down) uses these same two numbers, so the bottom edge of
-# this transcript box always lines up exactly with the bottom edge of the gauge.
+# Keep the transcript slightly above the "Now" gauge bottom, leaving more space
+# above the Timeframe and Summary controls without moving the gauge.
 GAUGE_BOTTOM = 0.22
 GAUGE_HEIGHT = 0.68
-transcript_panel_bottom = GAUGE_BOTTOM
+transcript_panel_bottom = GAUGE_BOTTOM + 0.01
 transcript_panel_top = IDENTITY_BOX_BOTTOM - IDENTITY_TRANSCRIPT_GAP
 # axes now spans the whole bordered box (was starting ~0.05 below its top), so the title/text sit higher
 transcript_panel_ax = plt.axes([LEFT_COL_X, transcript_panel_bottom, LEFT_COL_W, transcript_panel_top - transcript_panel_bottom])
@@ -2166,8 +2166,7 @@ def on_timeframe_change(label):
 
 # summary_panel_ax = plt.axes([0.23, 0.065, 0.13, 0.15])
 # radio_ax = plt.axes([0.73, 0.75, 0.13, 0.15])
-# summary_panel_ax = plt.axes([0.14, 0.065, 0.23, 0.115])
-radio_ax = plt.axes([0.04, 0.065, 0.065, 0.115])
+radio_ax = plt.axes([0.04, 0.065, 0.0755, 0.115])
 radio_ax.set_title("Timeframe", fontsize=9)
 timeframe_radio = RadioButtons(radio_ax, list(TIMEFRAME_OPTIONS.keys()), active=list(TIMEFRAME_OPTIONS.keys()).index(DEFAULT_TIMEFRAME_LABEL))
 timeframe_radio.on_clicked(on_timeframe_change)
@@ -2351,7 +2350,7 @@ def update_gauge():
 # Channel panel, and color-coded to match the current tension level.
 # ---------------------------------------------------------------------------
 # summary_panel_ax = plt.axes([0.73, 0.22, 0.13, 0.15])
-summary_panel_ax = plt.axes([0.125, 0.065, 0.245, 0.115])
+summary_panel_ax = plt.axes([0.135, 0.065, 0.2355, 0.115])
 summary_panel_ax.set_title("Summary", fontsize=9)
 summary_panel_ax.set_xticks([])
 summary_panel_ax.set_yticks([])
