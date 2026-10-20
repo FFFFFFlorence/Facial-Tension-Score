@@ -502,11 +502,11 @@ draw_threshold_zones()
 # _check_transcript_finalize_result below.
 # ---------------------------------------------------------------------------
 # transcript_panel_ax = plt.axes([0.025, 0.190, 0.345, 0.660])
-# Keep the transcript box bottom aligned with the Start/Stop button row.
+# Match the transcript box bottom position used in v4.1.
 GAUGE_BOTTOM = 0.22
 GAUGE_HEIGHT = 0.68
 BUTTON_BOTTOM = 0.25
-transcript_panel_bottom = BUTTON_BOTTOM
+transcript_panel_bottom = GAUGE_BOTTOM + 0.01
 transcript_panel_top = 0.901 - 1 / (fig.get_figheight() * fig.dpi)
 # axes now spans the whole bordered box (was starting ~0.05 below its top), so the title/text sit higher
 transcript_panel_ax = plt.axes([0.04, transcript_panel_bottom, 0.33, transcript_panel_top - transcript_panel_bottom])
