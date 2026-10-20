@@ -16,6 +16,7 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.widgets import Button, RadioButtons, CheckButtons
+from matplotlib.transforms import Bbox, TransformedBbox
 
 from voice_analyzer import VoiceAnalyzer  # separate file, as requested
 from transcriber import Transcriber, TRANSCRIBER_BACKEND, group_episode_contexts       # separate file, local/offline speech-to-text
@@ -501,7 +502,11 @@ draw_threshold_zones()
 # _check_transcript_finalize_result below.
 # ---------------------------------------------------------------------------
 # transcript_panel_ax = plt.axes([0.025, 0.190, 0.345, 0.660])
-transcript_panel_bottom = 0.25
+# Keep the transcript box bottom aligned with the Start/Stop button row.
+GAUGE_BOTTOM = 0.22
+GAUGE_HEIGHT = 0.68
+BUTTON_BOTTOM = 0.25
+transcript_panel_bottom = BUTTON_BOTTOM
 transcript_panel_top = 0.901 - 1 / (fig.get_figheight() * fig.dpi)
 # axes now spans the whole bordered box (was starting ~0.05 below its top), so the title/text sit higher
 transcript_panel_ax = plt.axes([0.04, transcript_panel_bottom, 0.33, transcript_panel_top - transcript_panel_bottom])
@@ -526,37 +531,74 @@ transcript_text = transcript_panel_ax.text(
     transform=transcript_panel_ax.transAxes,
     clip_on=True,
 )
-transcript_text.set_clip_box(transcript_panel_ax.bbox)
+# NOTE: the clip box of transcript_text is NOT the whole panel any more - it is the "viewport"
+# (the area under the title and to the left of the scrollbar), set in
+# _layout_transcript_vertical() below. That way text that has been scrolled out of view can
+# never be drawn over the title, over the scrollbar, or outside the box.
 
 TRANSCRIPT_GAP_PT = 20          # gap (points) from box top to title, and the SAME gap from title to the contents
+TRANSCRIPT_BOTTOM_GAP_PT = 8    # empty strip between the bottom of the text area and the bottom border
+
+# ---- Scrollbar (right-hand side of the panel) ------------------------------------------------
+# Sizes are fractions of the panel's width / height. The bar only appears when the text is
+# taller than the text area. Drag the thumb, click the empty track to page up/down, or use the
+# mouse wheel while the pointer is over the panel.
+TRANSCRIPT_SCROLLBAR_W = 0.035
+TRANSCRIPT_SCROLLBAR_PAD = 0.012        # gap between the scrollbar and the panel's right border
+TRANSCRIPT_SCROLLBAR_MIN_THUMB = 0.05   # the thumb never gets shorter than this (fraction of panel height)
+TRANSCRIPT_WHEEL_LINES = 3              # lines moved per mouse-wheel notch
+_SB_X0 = 1.0 - TRANSCRIPT_SCROLLBAR_PAD - TRANSCRIPT_SCROLLBAR_W
+TRANSCRIPT_SIDE_MARGIN = 0.04           # empty space left of the text (fraction of the panel width)
+TRANSCRIPT_TEXT_RIGHT = _SB_X0 - 0.02   # text is wrapped (and clipped) to end here, left of the scrollbar
+TRANSCRIPT_BASE_FONT = 8.0
+
+transcript_scroll_track = plt.Rectangle(
+    (_SB_X0, 0.0), TRANSCRIPT_SCROLLBAR_W, 0.0, transform=transcript_panel_ax.transAxes,
+    facecolor="#e4e4e4", edgecolor="none", zorder=2, visible=False,
+)
+transcript_scroll_thumb = plt.Rectangle(
+    (_SB_X0, 0.0), TRANSCRIPT_SCROLLBAR_W, 0.0, transform=transcript_panel_ax.transAxes,
+    facecolor="#9a9a9a", edgecolor="none", zorder=3, visible=False,
+)
+transcript_panel_ax.add_patch(transcript_scroll_track)
+transcript_panel_ax.add_patch(transcript_scroll_thumb)
+
+# All scroll maths below is in "panel units": 0 = bottom edge of the panel, 1 = top edge.
+_tscroll = {
+    "top": 0.0, "bottom": 0.0,   # the text area: where text is visible
+    "content": 0.0,              # height of the whole wrapped text
+    "offset": 0.0,               # how far the text has been scrolled up (0 = start of the text)
+    "drag_dy": None,             # while dragging the thumb: grab point, measured down from the thumb's top
+}
+_tview = {"msg": None, "color": "dimgray"}   # last status message shown (lets the per-cycle refresh skip no-ops)
+_transcript_entries = []        # last post-session entries shown (re-wrapped if the window is resized)
 
 
 def _layout_transcript_vertical():
-    """Title sits TRANSCRIPT_GAP_PT below the top of the box; the contents start
-    the same distance below the title. Returns the pixel height left for text."""
+    """Title sits TRANSCRIPT_GAP_PT below the top of the box; the text area starts the same
+    distance below the title and ends TRANSCRIPT_BOTTOM_GAP_PT above the bottom border.
+    Also clips the text to that area."""
     renderer = fig.canvas.get_renderer()
     H = transcript_panel_ax.get_window_extent().height
     g = TRANSCRIPT_GAP_PT * fig.dpi / 72.0
     transcript_title.set_y(1 - g / H)
     title_h = transcript_title.get_window_extent(renderer).height
-    transcript_text.set_y(1 - (2 * g + title_h) / H)
-    return H - (2 * g + title_h) - g
-
-
-TRANSCRIPT_SIDE_MARGIN = 0.04   # fraction of the panel width left empty on BOTH the left and the right
-TRANSCRIPT_BASE_FONT = 8.0
-TRANSCRIPT_FONT_SIZES = (8.0, 7.4, 6.8, 6.2, 5.6, 5.0)   # largest that fits the panel is used
-_transcript_entries = []        # last post-session entries shown (re-wrapped if the window is resized)
+    _tscroll["top"] = 1 - (2 * g + title_h) / H
+    _tscroll["bottom"] = TRANSCRIPT_BOTTOM_GAP_PT * fig.dpi / 72.0 / H
+    transcript_text.set_clip_box(TransformedBbox(
+        Bbox.from_extents(0.0, _tscroll["bottom"], _SB_X0 - 0.005, _tscroll["top"]),
+        transcript_panel_ax.transAxes,
+    ))
 
 
 def _wrap_to_panel(text, fontsize):
-    """Word-wraps text to the panel's REAL pixel width (minus equal left/right
-    margins), measured with the actual font - so lines run all the way across
-    the panel instead of stopping at a guessed character count."""
+    """Word-wraps text to the panel's REAL pixel width (minus the left margin and the scrollbar
+    column), measured with the actual font - so lines run all the way across the text area
+    instead of stopping at a guessed character count."""
     renderer = fig.canvas.get_renderer()
     fp = transcript_text.get_fontproperties().copy()
     fp.set_size(fontsize)
-    max_w = transcript_panel_ax.get_window_extent().width * (1 - 2 * TRANSCRIPT_SIDE_MARGIN)
+    max_w = transcript_panel_ax.get_window_extent().width * (TRANSCRIPT_TEXT_RIGHT - TRANSCRIPT_SIDE_MARGIN)
 
     def width(s):
         return renderer.get_text_width_height_descent(s, fp, False)[0]
@@ -578,53 +620,143 @@ def _wrap_to_panel(text, fontsize):
     return "\n".join(lines)
 
 
-def _render_transcript_entries(entries):
-    """Shows ALL entries in full. If they don't fit the panel at the normal
-    size, the font is shrunk (down to a minimum) until they do; only if they
-    still don't fit at the smallest size are trailing entries left off, with
-    a note pointing to report.txt (which always has everything)."""
+def _apply_transcript_scroll():
+    """Moves the text to the current scroll offset (clamped) and redraws the scrollbar."""
+    top, bottom = _tscroll["top"], _tscroll["bottom"]
+    view_h = max(top - bottom, 1e-6)
+    content = _tscroll["content"]
+    H = transcript_panel_ax.get_window_extent().height
+    max_off = max(content - view_h, 0.0)
+    off = min(max(_tscroll["offset"], 0.0), max_off)
+    _tscroll["offset"] = off
+    transcript_text.set_y(top + off)        # the text's top edge; scrolling moves the text UP
+
+    needs_bar = max_off > 2.0 / H           # ignore overflow of under ~2 pixels
+    transcript_scroll_track.set_visible(needs_bar)
+    transcript_scroll_thumb.set_visible(needs_bar)
+    if needs_bar:
+        thumb_h = min(max(view_h * view_h / content, TRANSCRIPT_SCROLLBAR_MIN_THUMB), view_h)
+        thumb_top = top - (off / max_off) * (view_h - thumb_h)
+        transcript_scroll_track.set_bounds(_SB_X0, bottom, TRANSCRIPT_SCROLLBAR_W, view_h)
+        transcript_scroll_thumb.set_bounds(_SB_X0, thumb_top - thumb_h, TRANSCRIPT_SCROLLBAR_W, thumb_h)
+    fig.canvas.draw_idle()
+
+
+def _set_transcript_content(text, color, reset_scroll=True):
+    """Puts `text` in the panel at the normal font size, wrapped to the panel's width, and
+    updates the scrollbar. Anything taller than the text area is reached by scrolling."""
+    renderer = fig.canvas.get_renderer()
+    _layout_transcript_vertical()
+    transcript_text.set_fontsize(TRANSCRIPT_BASE_FONT)
+    transcript_text.set_color(color)
+    transcript_text.set_text(_wrap_to_panel(text, TRANSCRIPT_BASE_FONT))
+    H = transcript_panel_ax.get_window_extent().height
+    _tscroll["content"] = transcript_text.get_window_extent(renderer).height / H
+    if reset_scroll:
+        _tscroll["offset"] = 0.0
+    _apply_transcript_scroll()
+
+
+def _show_transcript_message(text, color="dimgray"):
+    """Short status message (replaces whatever the panel was showing, scroll position included)."""
+    if not _transcript_entries and _tview["msg"] == text and _tview["color"] == color:
+        return   # unchanged - this is called every update cycle
+    _transcript_entries.clear()
+    _tview["msg"], _tview["color"] = text, color
+    _set_transcript_content(text, color, reset_scroll=True)
+
+
+def _render_transcript_entries(entries, reset_scroll=True):
+    """Shows ALL entries in full, at the normal font size, separated by a blank line. Text that
+    doesn't fit the panel is reached by scrolling (scrollbar on the right / mouse wheel) instead
+    of being shrunk or cut off. (report.txt always has everything too.)"""
     global _transcript_entries
     _transcript_entries = list(entries)
-    renderer = fig.canvas.get_renderer()
-    avail_h = _layout_transcript_vertical()
-
-    n = len(entries)
-    while True:
-        for fs in TRANSCRIPT_FONT_SIZES:
-            body = "\n\n".join(entries[:n])
-            if n < len(entries):
-                body += f"\n\n(+{len(entries) - n} konteks lainnya - lihat report.txt)"
-            transcript_text.set_fontsize(fs)
-            transcript_text.set_text(_wrap_to_panel(body, fs))
-            if transcript_text.get_window_extent(renderer).height <= avail_h:
-                return
-        if n <= 1:
-            return
-        n -= 1
+    _tview["msg"] = None
+    _set_transcript_content("\n\n".join(entries), "black", reset_scroll=reset_scroll)
 
 
 def _on_transcript_resize(event):
-    _layout_transcript_vertical()
+    # re-wrap to the new panel width, keeping the scroll position (it is clamped if the text got shorter)
     if _transcript_entries:
-        _render_transcript_entries(_transcript_entries)
+        _render_transcript_entries(_transcript_entries, reset_scroll=False)
+    elif _tview["msg"] is not None:
+        _set_transcript_content(_tview["msg"], _tview["color"], reset_scroll=False)
+
+
+# ---- Mouse handling for the scrollbar / wheel ------------------------------------------------
+def _transcript_panel_xy(event):
+    """Mouse position in panel units (0..1 across / up the transcript panel)."""
+    return transcript_panel_ax.transAxes.inverted().transform((event.x, event.y))
+
+
+def _on_transcript_wheel(event):
+    if event.x is None or not transcript_scroll_track.get_visible():
+        return
+    if not transcript_panel_ax.bbox.contains(event.x, event.y):
+        return
+    step = event.step if getattr(event, "step", 0) else (1 if event.button == "up" else -1)
+    H = transcript_panel_ax.get_window_extent().height
+    line_h = TRANSCRIPT_BASE_FONT * 1.2 * fig.dpi / 72.0 / H      # one text line, in panel units
+    _tscroll["offset"] -= step * TRANSCRIPT_WHEEL_LINES * line_h  # wheel up = show earlier text
+    _apply_transcript_scroll()
+
+
+def _on_transcript_press(event):
+    if event.button != 1 or event.x is None or not transcript_scroll_track.get_visible():
+        return
+    x, y = _transcript_panel_xy(event)
+    top, bottom = _tscroll["top"], _tscroll["bottom"]
+    if not (_SB_X0 <= x <= _SB_X0 + TRANSCRIPT_SCROLLBAR_W and bottom <= y <= top):
+        return
+    thumb_bottom = transcript_scroll_thumb.get_y()
+    thumb_top = thumb_bottom + transcript_scroll_thumb.get_height()
+    if thumb_bottom <= y <= thumb_top:
+        _tscroll["drag_dy"] = thumb_top - y                       # start dragging the thumb
+    else:                                                          # click on the empty track = page up / down
+        _tscroll["offset"] += (-1 if y > thumb_top else 1) * 0.9 * (top - bottom)
+        _apply_transcript_scroll()
+
+
+def _on_transcript_drag(event):
+    if _tscroll["drag_dy"] is None or event.x is None:
+        return
+    _x, y = _transcript_panel_xy(event)
+    top, bottom = _tscroll["top"], _tscroll["bottom"]
+    view_h = max(top - bottom, 1e-6)
+    max_off = max(_tscroll["content"] - view_h, 0.0)
+    travel = max(view_h - transcript_scroll_thumb.get_height(), 1e-6)
+    thumb_top = y + _tscroll["drag_dy"]
+    frac = min(max((top - thumb_top) / travel, 0.0), 1.0)
+    _tscroll["offset"] = frac * max_off
+    _apply_transcript_scroll()
+
+
+def _on_transcript_release(event):
+    _tscroll["drag_dy"] = None
 
 
 fig.canvas.mpl_connect("resize_event", _on_transcript_resize)
-_layout_transcript_vertical()
+fig.canvas.mpl_connect("scroll_event", _on_transcript_wheel)
+fig.canvas.mpl_connect("button_press_event", _on_transcript_press)
+fig.canvas.mpl_connect("motion_notify_event", _on_transcript_drag)
+fig.canvas.mpl_connect("button_release_event", _on_transcript_release)
+
+
+def _transcript_status_text():
+    if transcriber is None:
+        return "Transkripsi: mikrofon tidak aktif\n(gagal dibuka atau belum siap)."
+    return "Rekaman suara akan diproses setelah session selesai."
 
 
 def update_transcript_panel():
     """Called every update cycle during a session - only a status message
     (there is no live text). After Stop, the finalize-and-poll pair below
     takes over this same artist for the post-session context list."""
-    transcript_text.set_fontsize(TRANSCRIPT_BASE_FONT)
-    transcript_text.set_color("dimgray")
-    if transcriber is None:
-        transcript_text.set_text("Transkripsi: mikrofon tidak aktif\n(gagal dibuka atau belum siap).")
-        return
-    transcript_text.set_text(
-        "Rekaman suara akan diproses setelah session selesai."
-    )
+    _show_transcript_message(_transcript_status_text())
+
+
+_show_transcript_message("Menunjukan konteks percakapan saat tingkat tension meningkat.")
 
 
 # Result handoff for the background post-session transcript finalize step -
@@ -1013,18 +1145,18 @@ def summary_table_lines(stats, summ, compact=False):
     if not compact:
         out.append(("", "text"))
     if monitored:
-        values = "  ".join(f"{name} {summ['secs'][name] / monitored * 100:.0f}%"
-                           for name in ("BELOW", "BASELINE", "ELEVATED", "HIGH"))
+        parts = [f"{name} {summ['secs'][name] / monitored * 100:.0f}%"
+                 for name in ("BELOW", "BASELINE", "ELEVATED", "HIGH")]
         if compact:
-            out.append(("Waktu per level:", "text"))
-            out.append(("  " + values, "text"))
+            # one line, single spaces between the items (shorter than the report's two spaces)
+            out.append(("Waktu per level: " + " ".join(parts), "text"))
         else:
-            out.append((f"{'Waktu per level':<18} : " + values, "text"))
+            out.append((f"{'Waktu per level':<18} : " + "  ".join(parts), "text"))
     if summ["peak"] is not None:
         pv, pt, pl = summ["peak"]
         if compact:
-            out.append((f"Skor tertinggi : {pv:+.2f} pada {_mmss(pt)} ({pl})", "text"))
-            out.append((f"Skor rata-rata : {summ['mean']:+.2f} (0 = baseline)", "text"))
+            out.append((f"Skor tertinggi: {pv:+.2f} pada {_mmss(pt)} ({pl})", "text"))
+            out.append((f"Skor rata-rata: {summ['mean']:+.2f} (0 = baseline)", "text"))
         else:
             out.append((f"{'Skor tertinggi':<18} : {pv:+.2f} pada {_mmss(pt)}  ({pl})", "text"))
             out.append((f"{'Skor rata-rata':<18} : {summ['mean']:+.2f}  (0 = sama dengan kondisi awal)", "text"))
@@ -1373,8 +1505,7 @@ def start_openface(event):
         if transcription_enabled:
             print("Transcription enabled but the microphone failed to start - "
                   "transcription unavailable this session.")
-        transcript_text.set_text("Transkripsi: mikrofon tidak aktif\n(gagal dibuka atau belum siap).")
-        transcript_text.set_color("dimgray")
+        _show_transcript_message("Transkripsi: mikrofon tidak aktif\n(gagal dibuka atau belum siap).")
 
     # full reset so Start -> Stop -> Start again behaves as a clean new session
     start_time = None
@@ -1385,6 +1516,7 @@ def start_openface(event):
     face_lost = False
     _openface_exit_reported = False
     _transcript_entries.clear()   # else a window resize would redraw the PREVIOUS session's transcript
+    _show_transcript_message(_transcript_status_text())   # and clear the old text + scroll position now
     _autosave["last"] = time.time()
     _autosave["written"] = 0
     big_status_text.set_fontsize(26)
@@ -1505,11 +1637,10 @@ def stop_openface(event):
             daemon=False,
         )
         _transcript_thread.start()
-        transcript_text.set_text(
+        _show_transcript_message(
             "Memproses transkrip..."
             if TRANSCRIBER_BACKEND == "assemblyai_async"
             else "Menyelesaikan transkrip...")
-        transcript_text.set_color("dimgray")
 
     # give any snapshot still being copied a moment to finish, so it gets tagged in the log
     _deadline = time.time() + 1.5
@@ -1600,11 +1731,11 @@ def _on_window_close(event):
 fig.canvas.mpl_connect("close_event", _on_window_close)
 
 
-button_ax = plt.axes([0.476, 0.25, 0.15, 0.075])
+button_ax = plt.axes([0.476, BUTTON_BOTTOM, 0.15, 0.075])
 start_button = Button(button_ax, "Start OpenFace")
 start_button.on_clicked(start_openface)
 
-stop_button_ax = plt.axes([0.66, 0.25, 0.15, 0.075])
+stop_button_ax = plt.axes([0.66, BUTTON_BOTTOM, 0.15, 0.075])
 stop_button = Button(stop_button_ax, "Stop")
 stop_button.on_clicked(stop_openface)
 
@@ -1795,7 +1926,8 @@ def on_timeframe_change(label):
 
 # summary_panel_ax = plt.axes([0.23, 0.065, 0.13, 0.15])
 # radio_ax = plt.axes([0.73, 0.75, 0.13, 0.15])
-radio_ax = plt.axes([0.04, 0.065, 0.08, 0.115])
+# summary_panel_ax = plt.axes([0.14, 0.065, 0.23, 0.115])
+radio_ax = plt.axes([0.04, 0.065, 0.065, 0.115])
 radio_ax.set_title("Timeframe", fontsize=9)
 timeframe_radio = RadioButtons(radio_ax, list(TIMEFRAME_OPTIONS.keys()), active=list(TIMEFRAME_OPTIONS.keys()).index(DEFAULT_TIMEFRAME_LABEL))
 timeframe_radio.on_clicked(on_timeframe_change)
@@ -1858,7 +1990,7 @@ def update_voice_panel():
 # recent value and slowly decays back down. Meant to be readable at a
 # glance, complementing the full line chart rather than replacing it.
 # ---------------------------------------------------------------------------
-gauge_ax = plt.axes([0.90, 0.22, 0.06, 0.68])
+gauge_ax = plt.axes([0.90, GAUGE_BOTTOM, 0.06, GAUGE_HEIGHT])
 gauge_ax.set_title("Now", fontsize=9)
 gauge_ax.set_xticks([])
 gauge_ax.set_xlim(0, 1)
@@ -1979,7 +2111,7 @@ def update_gauge():
 # Channel panel, and color-coded to match the current tension level.
 # ---------------------------------------------------------------------------
 # summary_panel_ax = plt.axes([0.73, 0.22, 0.13, 0.15])
-summary_panel_ax = plt.axes([0.14, 0.065, 0.23, 0.115])
+summary_panel_ax = plt.axes([0.125, 0.065, 0.245, 0.115])
 summary_panel_ax.set_title("Summary", fontsize=9)
 summary_panel_ax.set_xticks([])
 summary_panel_ax.set_yticks([])
@@ -2035,9 +2167,9 @@ conclusion_note_text = summary_panel_ax.text(
 # whole table fits the panel (so it works at any window size) and is re-fitted
 # when the window is resized.
 # ---------------------------------------------------------------------------
-SUMMARY_TABLE_FONT_SIZES = (12.0, 11.0, 10.0, 9.5, 9.0, 8.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0)   # biggest that fits is used
+SUMMARY_TABLE_FONT_SIZES = (14.0, 13.0, 12.0, 11.0, 10.5, 10.0, 9.5, 9.0, 8.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0)   # biggest that fits is used
 SUMMARY_TABLE_SIDE_MARGIN = 0.035
-SUMMARY_TABLE_LINE_SPACING = 1.28   # line height = font size x this
+SUMMARY_TABLE_LINE_SPACING = 1.15   # smallest allowed line pitch = font size x this
 SUMMARY_TABLE_COLORS = {"header": "dimgray", "ELEVATED": "#c77700", "HIGH": "#b00020", "text": "black"}
 _summary_table_artists = []
 _summary_table_rows = None
@@ -2055,6 +2187,13 @@ def _clear_session_table():
     conclusion_note_text.set_visible(True)
 
 
+# The table is spread so its FIRST line sits level with the title line of the "Panduan Level
+# Tension" panel and its LAST line level with that panel's "PENTING" line. (Those are the
+# y positions 0.92 and 0.20 inside legend_ax, where the legend's text is placed.)
+LEGEND_TITLE_Y = 0.92
+LEGEND_PENTING_Y = 0.20
+
+
 def _render_session_table():
     for t in _summary_table_artists:
         t.remove()
@@ -2063,8 +2202,13 @@ def _render_session_table():
         return
     renderer = fig.canvas.get_renderer()
     bbox = summary_panel_ax.get_window_extent()
+    lbox = legend_ax.get_window_extent()
+    # target positions in the Summary panel's own axes coordinates
+    y_first = (lbox.y0 + LEGEND_TITLE_Y * lbox.height - bbox.y0) / bbox.height
+    y_last = (lbox.y0 + LEGEND_PENTING_Y * lbox.height - bbox.y0) / bbox.height
+    n = len(_summary_table_rows)
+    step = (y_first - y_last) / (n - 1) if n > 1 else 0.0       # axes fraction between lines
     max_w = bbox.width * (1 - 2 * SUMMARY_TABLE_SIDE_MARGIN)
-    avail_h = bbox.height * 0.94
     fp = conclusion_prefix_text.get_fontproperties().copy()
     fp.set_family("monospace")
 
@@ -2073,14 +2217,12 @@ def _render_session_table():
         fp.set_size(fs)
         widest = max(renderer.get_text_width_height_descent(txt, fp, False)[0] for txt, _k in _summary_table_rows)
         line_h = fs * SUMMARY_TABLE_LINE_SPACING * fig.dpi / 72.0
-        if widest <= max_w and line_h * len(_summary_table_rows) <= avail_h:
+        if widest <= max_w and (n == 1 or step * bbox.height >= line_h):
             chosen = fs
             break
-    line_h = chosen * SUMMARY_TABLE_LINE_SPACING * fig.dpi / 72.0
     for i, (txt, kind) in enumerate(_summary_table_rows):
-        y = 0.97 - (i * line_h) / bbox.height
         _summary_table_artists.append(summary_panel_ax.text(
-            SUMMARY_TABLE_SIDE_MARGIN, y, txt, fontsize=chosen, family="monospace", va="top", ha="left",
+            SUMMARY_TABLE_SIDE_MARGIN, y_first - i * step, txt, fontsize=chosen, family="monospace", va="top", ha="left",
             fontweight="bold" if kind in ("header", "ELEVATED", "HIGH") else "normal",
             color=SUMMARY_TABLE_COLORS.get(kind, "black"), transform=summary_panel_ax.transAxes, clip_on=True,
         ))
